@@ -23,8 +23,8 @@ include("../Utils/plot_rmse.jl")
 # 主程序入口
 # Convert a MATPOWER case file to a Julia PowerCase
 # Case 1 IEEE57
-# case_file_1 = "C:/Users/13733/Desktop/matpower-8.0/data/case57.m"
-case_file_1 ="C:/Users/13733/Desktop/matpower-8.0/data/case118.m"
+case_file_1 = "C:/Users/13733/Desktop/matpower-8.0/data/case57.m"
+# case_file_1 ="C:/Users/13733/Desktop/matpower-8.0/data/case118.m"
 μ1, ω1, Pg_inputs1, Qg_inputs1, Pd_inputs1, Qd_inputs1, Vg_inputs1, Vr_inputs1, θr_inputs1, G, B = generate_random_pf_samples_matpower(case_file_1)
 
 # 1. 训练MLP+MLP模型
