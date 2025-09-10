@@ -101,7 +101,7 @@ function generate_random_sample_for_upinn(case_file, num_samples=1000, load_fact
   end
   
   # 返回收集的样本
-  return  X, Ybus, pq_idx, pv_idx, ref_idx
+  return  X, Ybus, pq_idx, pv_idx, ref_idx, baseMVA
 end
 
 """

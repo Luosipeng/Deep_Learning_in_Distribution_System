@@ -1,13 +1,13 @@
-# 1. 图卷积层实现 - 保持不变
+# 1. 图卷积层实现
 struct GraphConv
     weight::Matrix{Float32}
     bias::Vector{Float32}
     σ::Function
 end
 
-function GraphConv(in_channels::Int, out_channels::Int, σ=relu)
-    weight = Flux.glorot_uniform(out_channels, in_channels)
-    bias = zeros(Float32, out_channels)
+function GraphConv(feature_dimension::Int, σ=relu)
+    weight = Flux.glorot_uniform(feature_dimension, feature_dimension)
+    bias = zeros(Float32, feature_dimension)
     return GraphConv(weight, bias, σ)
 end
 
@@ -32,88 +32,216 @@ function (gc::GraphConv)(X, A)
     X_conv = A_norm * X_f32
     
     # 线性变换和激活
-    return gc.σ.(X_conv * gc.weight' .+ gc.bias')
+    return gc.σ.(X_conv * gc.weight .+ gc.bias')
 end
 
 Flux.@functor GraphConv
 
-# 定义SiLU/Swish激活函数
-swish(x) = x * sigmoid(x)
+function create_gcn_network()
 
-# 2. 设计新的网络架构: 2GCN + 池化 + 2FC
-struct GCN2FC2
-    # 两层图卷积
-    gcn1::GraphConv
-    gcn2::GraphConv
-    
-    # 两层全连接
-    fc1::Dense
-    fc2::Dense
-    
-    # Dropout层
-    dropout::Dropout
+    feature_dimension = 2
+    # 创建GCN网络
+    gcn = GraphConv(feature_dimension)
+
+    return gcn
 end
 
-# 创建2GCN+池化+2FC网络
-function create_gcn2fc2(input_dim::Int, gcn1_dim::Int, gcn2_dim::Int, 
-                       fc1_dim::Int, output_dim::Int, dropout_rate::Float32=0.2f0)
-    # 创建两个图卷积层
-    gcn1 = GraphConv(input_dim, gcn1_dim)
-    gcn2 = GraphConv(gcn1_dim, gcn2_dim)
-    
-    # 创建两个全连接层，使用SiLU激活函数
-    fc1 = Dense(gcn2_dim, fc1_dim, swish)  # 修改为swish
-    fc2 = Dense(fc1_dim, output_dim, swish)  # 输出层也使用swish
-    
-    # 创建Dropout层
-    dropout = Dropout(dropout_rate)
-    
-    return GCN2FC2(gcn1, gcn2, fc1, fc2, dropout)
+# 定义SiLu激活函数（Sigmoid Linear Unit）
+silu(x) = x * sigmoid(x)
+
+# 2. 全连接层实现
+struct FCN
+    weight::Matrix{Float32}
+    bias::Vector{Float32}
+    σ::Function
 end
 
-# 网络的前向传播
-function (model::GCN2FC2)(X, A)
-    # 第一个图卷积层
-    h = model.gcn1(X, A)
-    h = model.dropout(h)
+function FCN(in_dim::Int, out_dim::Int; σ=silu)
+    weight = Flux.glorot_uniform(in_dim, out_dim)
+    bias = zeros(Float32, out_dim)
+    return FCN(weight, bias, σ)
+end
+
+function (fc::FCN)(X)
+    X_f32 = Float32.(X)
+    return fc.σ.(X_f32 * fc.weight .+ fc.bias')
+end
+
+Flux.@functor FCN
+
+# 3. 残差连接块实现
+struct ResidualBlock
+    main_path
+    shortcut
+    σ::Function
+end
+
+function ResidualBlock(in_dim::Int, out_dim::Int; σ=silu)
+    main_path = Chain(
+        FCN(in_dim, out_dim, σ=σ),
+        FCN(out_dim, out_dim, σ=identity)  # 注意这里不应用激活函数
+    )
     
-    # 第二个图卷积层
-    h = model.gcn2(h, A)
+    # 如果输入输出维度不同，需要投影
+    shortcut = in_dim == out_dim ? identity : FCN(in_dim, out_dim, σ=identity)
     
-    # 池化层 - 使用平均池化将节点特征聚合为图特征
-    h_pooled = mean(h, dims=1)  # 结果维度: [1, gcn2_dim]
-    h_pooled = vec(h_pooled)    # 转换为向量 [gcn2_dim]
+    return ResidualBlock(main_path, shortcut, σ)
+end
+
+function (rb::ResidualBlock)(x)
+    return rb.σ.(rb.main_path(x) + rb.shortcut(x))
+end
+
+Flux.@functor ResidualBlock (main_path, shortcut,)
+
+# 4. Beta缩放层实现
+struct BetaScaling
+    beta::Vector{Float32}
+end
+
+function BetaScaling(output_dim::Int; init_value::Float32=1.0f0)
+    return BetaScaling(fill(init_value, output_dim))
+end
+
+function (bs::BetaScaling)(x)
+    return x .* bs.beta'
+end
+
+Flux.@functor BetaScaling
+
+# 创建全连接网络（带残差连接和Beta缩放）
+function create_fc_network_with_residual(enhanced_features_y)
+    # 创建残差块
+    res_block1 = ResidualBlock(enhanced_features_y, 64)
+    res_block2 = ResidualBlock(64, 32)
     
-    # 第一个全连接层
-    h = model.fc1(h_pooled)
-    h = model.dropout(h)
+    # 最后一个全连接层
+    fc3 = FCN(32, 2, σ=identity)  # 输出层通常不使用激活函数
     
-    # 第二个全连接层 (输出层)
-    output_flat = model.fc2(h)
+    # 用于残差连接的投影（从输入直接到输出）
+    projection = FCN(enhanced_features_y, 2, σ=identity)
     
-    # 重塑输出为矩阵形式 (size(X, 1)-1, 2)
-    n_nodes = Int(length(output_flat) / 2)
-    output_matrix = reshape(output_flat, 2, n_nodes)'
+    # Beta缩放
+    beta_scaling = BetaScaling(2)
     
-    return output_matrix
+    return res_block1, res_block2, fc3, projection, beta_scaling
 end
 
 
-# 使Flux能够识别并训练GCN2FC2的参数
-Flux.@functor GCN2FC2
+# 构建损失函数
+function calculate_loss(ΔP, ΔQ, pv_idx, ref_idx)
+    # 初始化
+    ω_p = ones(size(ΔP,1))
+    ω_q = ones(size(ΔQ,1))
 
-# 3. 提供一个便捷的创建函数，支持hidden_dims数组
-function create_gcn_network(input_dim::Int, hidden_dims::Vector{Int}, output_dim::Int, dropout_rate::Float32=0.2f0)
-    # 确保hidden_dims至少有3个元素 (2个GCN层 + 1个FC层)
-    if length(hidden_dims) < 3
-        error("hidden_dims应至少包含3个元素: [gcn1_dim, gcn2_dim, fc1_dim]")
-    end
-    
-    # 提取维度
-    gcn1_dim = hidden_dims[1]
-    gcn2_dim = hidden_dims[2]
-    fc1_dim = hidden_dims[3]
-    
-    # 创建网络
-    return create_gcn2fc2(input_dim, gcn1_dim, gcn2_dim, fc1_dim, output_dim, dropout_rate)
+    ω_p[ref_idx] .= 0
+    ω_q[ref_idx] .= 0
+    ω_q[pv_idx] .= 0
+
+    n = length(ΔP) + length(ΔQ)
+
+    L = (sum(ω_p.*ΔP.^2) + sum(ω_q.*ΔQ.^2))/n
+
+    return L, ω_p, ω_q
+end
+
+function calculate_the_deviation(pq_idx, pv_idx, ref_idx, Ybus, V)
+    # 计算雅可比矩阵
+    dSbus_dVa, dSbus_dVm = PowerFlow.dSbus_dV(Ybus, V)
+    dP_dV = real.(dSbus_dVm)
+    dP_dδ = real.(dSbus_dVa)
+    dQ_dV = imag.(dSbus_dVm)
+    dQ_dδ = real.(dSbus_dVa)
+
+    # dP_dV
+    dP_dV_pq_pq =  dP_dV[pq_idx, :]
+    dP_dV_pq_pq =  dP_dV_pq_pq[:, pq_idx]
+
+    dP_dV_pv_pq = dP_dV[pv_idx, :]
+    dP_dV_pv_pq = dP_dV_pv_pq[:, pq_idx]
+
+    dP_dV_ref_pq = spzeros(1, length(pq_idx))
+
+    # dP_dδ
+    dP_dδ_pq_pq = dP_dδ[pq_idx, :]
+    dP_dδ_pq_pq = dP_dδ_pq_pq[:, pq_idx]
+    dP_dδ_pq_pv = dP_dδ[pq_idx, :]
+    dP_dδ_pq_pv = dP_dδ_pq_pv[:, pv_idx]
+
+    dP_dδ_pv_pq = dP_dδ[pv_idx, :]
+    dP_dδ_pv_pq = dP_dδ_pv_pq[:, pq_idx]
+    dP_dδ_pv_pv = dP_dδ[pv_idx, :]
+    dP_dδ_pv_pv = dP_dδ_pv_pv[:, pv_idx]
+
+    dP_dδ_ref_pq = spzeros(1, length(pq_idx))
+    dP_dδ_ref_pv = spzeros(1, length(pv_idx))
+
+    # dP_dPn
+    dP_dPn_pq_ref = zeros(length(pq_idx),1)
+    dP_dPn_pv_ref = zeros(length(pv_idx),1)
+    dP_dPn_ref_ref = -ones(length(ref_idx),1)
+
+    # dP_dQ
+    dP_dQ_pq_pv = zeros(length(pq_idx),length(pv_idx))
+    dP_dQ_pq_ref = zeros(length(pq_idx),length(ref_idx))
+    dP_dQ_pv_pv = zeros(length(pv_idx),length(pv_idx))
+    dP_dQ_pv_ref = zeros(length(pv_idx),length(ref_idx))
+    dP_dQ_ref_pv = zeros(length(ref_idx),length(pv_idx))
+    dP_dQ_ref_ref = zeros(length(ref_idx),1)
+
+    # dQ_dV
+    dQ_dV_pq_pq =  dQ_dV[pq_idx, :]
+    dQ_dV_pq_pq =  dQ_dV_pq_pq[:, pq_idx]
+
+    dQ_dV_pv_pq = spzeros(length(pv_idx), length(pq_idx))
+
+    dQ_dV_ref_pq = spzeros(1, length(pq_idx))
+
+    # dQ_dδ
+    dQ_dδ_pq_pq = dQ_dδ[pq_idx, :]
+    dQ_dδ_pq_pq = dQ_dδ_pq_pq[:, pq_idx]
+    dQ_dδ_pq_pv = dQ_dδ[pq_idx, :]
+    dQ_dδ_pq_pv = dQ_dδ_pq_pv[:, pv_idx]
+
+    dQ_dδ_pv_pq = spzeros(length(pv_idx), length(pq_idx))
+    dQ_dδ_pv_pv = spzeros(length(pv_idx), length(pv_idx))
+
+    dQ_dδ_ref_pq = spzeros(1, length(pq_idx))
+    dQ_dδ_ref_pv = spzeros(1, length(pv_idx))
+
+    # dQ_dPn
+    dQ_dPn_pq_ref = spzeros(length(pq_idx), 1)
+    dQ_dPn_pv_ref = spzeros(length(pv_idx), 1)
+    dQ_dPn_ref_ref = spzeros(length(ref_idx), 1)
+
+    # dQ_dQ
+    dQ_dQ_pq_pv = spzeros(length(pq_idx), length(pv_idx))
+    dQ_dQ_pq_ref = spzeros(length(pq_idx), length(ref_idx))
+
+    dQ_dQ_pv_pv = spdiagm(0 => -ones(length(pv_idx)))
+    dQ_dQ_pv_ref = spzeros(length(pv_idx), length(ref_idx))
+
+    dQ_dQ_ref_pv = spzeros(length(ref_idx), length(pv_idx))
+    dQ_dQ_ref_ref = spdiagm(0 => -ones(length(ref_idx)))
+
+    # 拼接矩阵
+    J = [dP_dV_pq_pq dP_dδ_pq_pq dP_dδ_pq_pv dP_dPn_pq_ref dP_dQ_pq_pv dP_dQ_pq_ref;
+     dP_dV_pv_pq dP_dδ_pv_pq dP_dδ_pv_pv dP_dPn_pv_ref dP_dQ_pv_pv dP_dQ_pv_ref;
+     dP_dV_ref_pq dP_dδ_ref_pq dP_dδ_ref_pv dP_dPn_ref_ref dP_dQ_ref_pv dP_dQ_ref_ref;
+     dQ_dV_pq_pq dQ_dδ_pq_pq dQ_dδ_pq_pv dQ_dPn_pq_ref dQ_dQ_pq_pv dQ_dQ_pq_ref;
+     dQ_dV_pv_pq dQ_dδ_pv_pq dQ_dδ_pv_pv dQ_dPn_pv_ref dQ_dQ_pv_pv dQ_dQ_pv_ref;
+     dQ_dV_ref_pq dQ_dδ_ref_pq dQ_dδ_ref_pv dQ_dPn_ref_ref dQ_dQ_ref_pv dQ_dQ_ref_ref
+     ]
+
+    return J
+end
+
+function calculate_chain_deviation(J, pv_idx, pq_idx, ref_idx, ΔP, ΔQ, ω_p, ω_q)
+    n = length(pq_idx) + length(pv_idx) + length(ref_idx)
+    P_vector = (ω_p./n).* ΔP
+    Q_vector = (ω_q./n).* ΔQ
+    mismatch = vcat(P_vector, Q_vector)
+    deviation = mismatch' * J
+
+    return deviation
 end
