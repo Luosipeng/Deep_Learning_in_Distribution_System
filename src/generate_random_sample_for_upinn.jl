@@ -1,6 +1,6 @@
 using TimeSeriesPowerFlow
 include("../ios/matlab2julia.jl")
-function generate_random_sample_for_upinn(case_file, num_samples=1000, load_factor_range=(0.8, 1.2))
+function generate_random_sample_for_upinn(case_file, num_samples=200, load_factor_range=(0.8, 1.2))
   # 设置随机数种子，确保可重复性
   Random.seed!(42)
   
@@ -79,9 +79,9 @@ function generate_random_sample_for_upinn(case_file, num_samples=1000, load_fact
 
           # 提取功率注入
           P_pq, Q_pq, P_pv, V_pv, V_ref, θ_ref = extract_input_variables(input_case)
-          X[:,1,collected_samples] += P_pq # PQ节点
-          X[:,2,collected_samples] += Q_pq # PQ节点
-          X[:,1,collected_samples] += P_pv # PV节点
+          X[:,1,collected_samples] += P_pq./baseMVA # PQ节点
+          X[:,2,collected_samples] += Q_pq./baseMVA # PQ节点
+          X[:,1,collected_samples] += P_pv./baseMVA # PV节点
           X[:,2,collected_samples] += V_pv # PV节点
           X[:,1,collected_samples] += V_ref # 参考节点电压
           X[:,2,collected_samples] += θ_ref # 参考节点电压角度

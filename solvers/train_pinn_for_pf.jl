@@ -1,247 +1,437 @@
-# 1. 图卷积层实现
-struct GraphConv
-    weight::Matrix{Float32}
-    bias::Vector{Float32}
-    σ::Function
-end
-
-function GraphConv(feature_dimension::Int, σ=relu)
-    weight = Flux.glorot_uniform(feature_dimension, feature_dimension)
-    bias = zeros(Float32, feature_dimension)
-    return GraphConv(weight, bias, σ)
-end
-
-function (gc::GraphConv)(X, A)
-    # 转换输入为Float32类型
-    X_f32 = Float32.(X)
-    A_f32 = Float32.(A)
-    
-    # 如果A是稀疏矩阵，转换为密集矩阵
-    if typeof(A_f32) <: SparseMatrixCSC
-        A_f32 = Matrix(A_f32)
+# ############################################################
+# # UPINN 极简复现脚本 修正版7
+# # 修复：LBFGS 行搜索缺少 LineSearches 导入的问题
+# # 增加：自动回退机制，如果未安装 LineSearches 则使用默认 LBFGS()
+# ############################################################
+# using Random, LinearAlgebra, SparseArrays, Statistics
+# using Flux
+# import Flux: sigmoid
+# using Optim
+# Random.seed!(42)
+include("../ios/data_generation_upinn.jl")
+# #---------------- 行搜索可选加载 ----------------#
+const USE_BACKTRACKING = true  # 想禁用直接设为 false
+const HAS_LINESEARCHES = let flag=false
+    if USE_BACKTRACKING
+        try
+            @eval using LineSearches
+            flag = true
+        catch e
+            @warn "未找到 LineSearches，将使用默认 LBFGS() 行搜索 (无 BackTracking)。安装：] add LineSearches 以启用。"
+            flag = false
+        end
     end
-    
-    # 计算度矩阵的逆平方根
-    D = Diagonal(sum(A_f32, dims=2)[:] .+ 1f-10)  # 添加小值防止除零
-    D_inv_sqrt = Diagonal(1f0 ./ sqrt.(diag(D)))
-    
-    # 归一化邻接矩阵: D^(-1/2) * A * D^(-1/2)
-    A_norm = D_inv_sqrt * A_f32 * D_inv_sqrt
-    
-    # 图卷积操作: D^(-1/2) * A * D^(-1/2) * X * W
-    X_conv = A_norm * X_f32
-    
-    # 线性变换和激活
-    return gc.σ.(X_conv * gc.weight .+ gc.bias')
+    flag
 end
 
+#---------------- 超参数 ----------------#
+const USE_FLOAT64   = true
+const T = USE_FLOAT64 ? Float64 : Float32
+
+const EPOCHS_ADAM   = 300
+const EPOCHS_LBFGS  = 200
+const BATCH_SIZE    = 256
+const LR_ADAM       = 1e-3
+const WP            = 1.0
+const WQ            = 1.0
+const ANGLE_TANH    = true
+const VMIN          = 0.90
+const VMAX          = 1.10
+const PRINT_EVERY   = 20
+const CLIP_NORM     = 5.0
+const L2_REG        = 0.0        # 可设 1e-8 微调
+const G_HIDDEN      = 64
+const MLP_HIDDEN    = 128
+const USE_LBFGS_DEF = true
+const ANGLE_SCALE   = π
+
+
+#---------------- 基础函数 ----------------#
+leaky_relu(x,α=0.01)= x>0 ? x : α*x
+silu(x)= x*sigmoid(x)
+
+#---------------- 图卷积 ----------------#
+struct GraphConv
+    W::Matrix{T}
+    b::Vector{T}
+    act::Function
+end
 Flux.@functor GraphConv
-
-function create_gcn_network()
-
-    feature_dimension = 2
-    # 创建GCN网络
-    gcn = GraphConv(feature_dimension)
-
-    return gcn
+function GraphConv(in_dim::Int,out_dim::Int; act=leaky_relu)
+    W=randn(T,in_dim,out_dim) * sqrt(T(2)/in_dim)
+    b=zeros(T,out_dim)
+    GraphConv(W,b,act)
+end
+function (g::GraphConv)(X::AbstractMatrix{<:Real}, A::SparseMatrixCSC{T,Int})
+    Xc = T.(X)
+    d  = vec(sum(A,dims=2))
+    D_inv = Diagonal( 1.0 ./ sqrt.(d .+ 1e-12) )
+    A_norm = D_inv * A * D_inv
+    Z = A_norm * Xc
+    g.act.(Z*g.W .+ g.b')
 end
 
-# 定义SiLu激活函数（Sigmoid Linear Unit）
-silu(x) = x * sigmoid(x)
-
-# 2. 全连接层实现
+#---------------- 全连接 ----------------#
 struct FCN
-    weight::Matrix{Float32}
-    bias::Vector{Float32}
+    W::Matrix{T}
+    b::Vector{T}
     σ::Function
 end
-
-function FCN(in_dim::Int, out_dim::Int; σ=silu)
-    weight = Flux.glorot_uniform(in_dim, out_dim)
-    bias = zeros(Float32, out_dim)
-    return FCN(weight, bias, σ)
-end
-
-function (fc::FCN)(X)
-    X_f32 = Float32.(X)
-    return fc.σ.(X_f32 * fc.weight .+ fc.bias')
-end
-
 Flux.@functor FCN
+function FCN(in_dim::Int,out_dim::Int; σ=silu)
+    W=randn(T,in_dim,out_dim) * sqrt(T(2)/in_dim)
+    b=zeros(T,out_dim)
+    FCN(W,b,σ)
+end
+(f::FCN)(X)= f.σ.(T.(X)*f.W .+ f.b')
 
-# 3. 残差连接块实现
-struct ResidualBlock
-    main_path
-    shortcut
-    σ::Function
+#---------------- 模型 ----------------#
+mutable struct UPINNModel
+    g1::GraphConv
+    g2::GraphConv
+    fc1::FCN
+    fc2::FCN
+    head::FCN
+end
+Flux.@functor UPINNModel
+function UPINNModel(in_dim; g_hidden=G_HIDDEN, mlp_hidden=MLP_HIDDEN)
+    g1=GraphConv(in_dim,g_hidden)
+    g2=GraphConv(g_hidden,g_hidden)
+    fc1=FCN(g_hidden+in_dim, mlp_hidden)
+    fc2=FCN(mlp_hidden, mlp_hidden)
+    head=FCN(mlp_hidden,2,σ=identity)
+    UPINNModel(g1,g2,fc1,fc2,head)
 end
 
-function ResidualBlock(in_dim::Int, out_dim::Int; σ=silu)
-    main_path = Chain(
-        FCN(in_dim, out_dim, σ=σ),
-        FCN(out_dim, out_dim, σ=identity)  # 注意这里不应用激活函数
+function (m::UPINNModel)(X,A; training=true)
+    H1 = m.g1(X,A)
+    H2 = m.g2(H1,A)
+    enh = hcat(H2, X)
+    Z = m.fc1(enh)
+    Z = m.fc2(Z)
+    m.head(Z)
+end
+
+#---------------- 输出映射 ----------------#
+function map_outputs(out, feat, idx::BusIndex, masks)
+    pq_mask    = masks[:pq_mask]
+    pv_mask    = masks[:pv_mask]
+    slack_mask = masks[:slack_mask]
+
+    a_code = out[:,1]
+    v_code = out[:,2]
+
+    pred_delta = ANGLE_TANH ? T.(ANGLE_SCALE .* tanh.(a_code)) : T.(a_code)
+    δ = pred_delta .* (1 .- slack_mask)
+
+    v_col6 = T.(feat[:,6])
+    v_col5 = T.(feat[:,5])
+
+    pred_v_pq = 0.5 .* (tanh.(v_code) .+ 1) .* (VMAX-VMIN) .+ VMIN
+    v_pv_given   = pv_mask    .* ( (v_col6 .> 0) .* v_col6 .+ (v_col6 .<= 0) .* v_col5 )
+    v_slack_given= slack_mask .* v_col5
+    Vmag = pred_v_pq .* pq_mask .+ v_pv_given .+ v_slack_given
+
+    V = Vmag .* cis.(δ)
+    return V, δ, Vmag
+end
+
+#---------------- 物理损失 ----------------#
+function physics_loss(s::DatasetSample, model::UPINNModel,
+                      A, Ybus, idx::BusIndex,
+                      masks, non_ref_idx, pq_idx; training=true)
+    out = model(s.feat, A; training=training)
+    V, δ, Vmag = map_outputs(out, s.feat, idx, masks)
+
+    S = V .* conj.(Ybus * V)
+    P_calc = real.(S)
+    Q_calc = imag.(S)
+
+    pv_mask    = masks[:pv_mask]
+    slack_mask = masks[:slack_mask]
+
+    Qpv_calc_vec = Q_calc .* pv_mask
+    Pslack_calc  = sum(P_calc .* slack_mask)
+
+    ΔP = s.P_spec[non_ref_idx] .- P_calc[non_ref_idx]
+    ΔQ = s.Q_spec[pq_idx]      .- Q_calc[pq_idx]
+
+    nP = length(ΔP); nQ = length(ΔQ)
+    lossP = WP * sum(abs2,ΔP)/max(1,nP)
+    lossQ = WQ * sum(abs2,ΔQ)/max(1,nQ)
+    reg   = L2_REG > 0 ? L2_REG * sum(abs2,Flux.params(model)) : 0
+    loss  = 0.5*(lossP + lossQ) + reg
+
+    return loss, ΔP, ΔQ, Dict(
+        :Vmag=>Vmag,
+        :δ=>δ,
+        :Qpv_calc=>Qpv_calc_vec,
+        :Pslack_calc=>Pslack_calc
     )
+end
+function physics_loss(s::DatasetSample, model::UPINNModel,
+                      A, idx::BusIndex,
+                      masks, non_ref_idx, pq_idx; training=true)
+    error("physics_loss 缺少 Ybus 参数，请使用 physics_loss(s, model, A, Ybus, idx, masks, non_ref_idx, pq_idx)")
+end
+
+#---------------- 批采样 ----------------#
+sample_batch(samples, b) = samples[rand(1:length(samples), min(b,length(samples)))]
+
+#---------------- 简易 Adam ----------------#
+mutable struct SimpleAdam
+    η::T; β1::T; β2::T; eps::T
+    m::IdDict{Any,Any}; v::IdDict{Any,Any}; t::Int
+end
+function SimpleAdam(η=LR_ADAM, β1=0.9, β2=0.999, eps=1e-8)
+    SimpleAdam(T(η),T(β1),T(β2),T(eps),IdDict{Any,Any}(),IdDict{Any,Any}(),0)
+end
+function adam_update!(opt::SimpleAdam, ps, gs)
+    opt.t += 1
+    for p in ps
+        g = gs[p]; g === nothing && continue
+        m = get!(opt.m,p, zeros(T,size(p)))
+        v = get!(opt.v,p, zeros(T,size(p)))
+        @. m = opt.β1*m + (1 - opt.β1)*g
+        @. v = opt.β2*v + (1 - opt.β2)*g^2
+        mhat = m / (1 - opt.β1^opt.t)
+        vhat = v / (1 - opt.β2^opt.t)
+        p .-= opt.η * mhat ./ (sqrt.(vhat) .+ opt.eps)
+    end
+end
+
+#---------------- Adam 阶段 ----------------#
+function train_adam!(model, samples, Ybus, A, idx;
+                     epochs=EPOCHS_ADAM, batch=BATCH_SIZE)
+    n_bus = size(samples[1].feat,1)
+    ref_set = Set(idx.ref)
+    non_ref_idx = [i for i in 1:n_bus if !(i in ref_set)]
+    pq_idx = idx.pq
+
+    pq_mask    = zeros(T,n_bus); pq_mask[idx.pq]    .= one(T)
+    pv_mask    = zeros(T,n_bus); pv_mask[idx.pv]    .= one(T)
+    slack_mask = zeros(T,n_bus); slack_mask[idx.ref].= one(T)
+    masks = Dict(:pq_mask=>pq_mask, :pv_mask=>pv_mask, :slack_mask=>slack_mask)
+
+    ps = Flux.params(model)
+    opt = SimpleAdam()
+
+    for ep in 1:epochs
+        bt = sample_batch(samples, batch)
+        gs = gradient(ps) do
+            total = zero(T)
+            for s in bt
+                L,_,_,_ = physics_loss(s, model, A, Ybus, idx, masks, non_ref_idx, pq_idx; training=true)
+                total += L
+            end
+            total / length(bt)
+        end
+        for p in ps
+            g = gs[p]; g===nothing && continue
+            gn = norm(g)
+            if gn > CLIP_NORM
+                g .= (CLIP_NORM/gn) .* g
+            end
+        end
+        adam_update!(opt, ps, gs)
+
+        if ep % PRINT_EVERY == 0 || ep == 1
+            accL=0.0; mP=0.0; mQ=0.0
+            for s in bt
+                L,ΔP,ΔQ,_ = physics_loss(s, model, A, Ybus, idx, masks, non_ref_idx, pq_idx; training=false)
+                accL += L
+                !isempty(ΔP) && (mP=max(mP, maximum(abs.(ΔP))))
+                !isempty(ΔQ) && (mQ=max(mQ, maximum(abs.(ΔQ))))
+            end
+            println("Epoch $(lpad(ep,4)) | Loss=$(round(accL/length(bt),digits=8))  ΔP_max=$(round(mP,digits=8))  ΔQ_max=$(round(mQ,digits=8))")
+        end
+    end
+    return (non_ref_idx=non_ref_idx, pq_idx=pq_idx, masks=masks)
+end
+
+#---------------- LBFGS 精调 ----------------#
+function lbfgs_refine!(model, samples, Ybus, A, idx, aux; max_iter=EPOCHS_LBFGS)
+    println("[LBFGS] 开始精调 ...")
+    ps = Flux.params(model)
+    arrays = [p for p in ps]
+    sizes  = map(size, arrays)
+    lengths= map(length, arrays)
+    offsets= cumsum(vcat(0, lengths[1:end-1]))
+    total_len = sum(lengths)
+
+    function pack()
+        v = zeros(T,total_len)
+        for (i,arr) in enumerate(arrays)
+            rng = offsets[i]+1 : offsets[i]+lengths[i]
+            v[rng] .= vec(arr)
+        end
+        v
+    end
+    function unpack!(v)
+        for (i,arr) in enumerate(arrays)
+            rng = offsets[i]+1 : offsets[i]+lengths[i]
+            arr .= reshape(view(v,rng), sizes[i])
+        end
+    end
+
+    non_ref_idx = aux.non_ref_idx
+    pq_idx      = aux.pq_idx
+    masks       = aux.masks
+
+    function total_loss_and_grad(v)
+        unpack!(v)
+        gs = gradient(ps) do
+            acc = zero(T)
+            for s in samples
+                l,_,_,_ = physics_loss(s, model, A, Ybus, idx, masks, non_ref_idx, pq_idx; training=true)
+                acc += l
+            end
+            acc / length(samples)
+        end
+        L = zero(T)
+        for s in samples
+            l,_,_,_ = physics_loss(s, model, A, Ybus, idx, masks, non_ref_idx, pq_idx; training=false)
+            L += l
+        end
+        L /= length(samples)
+        gvec = zeros(T,total_len)
+        for (i,arr) in enumerate(arrays)
+            g = gs[arr]; g === nothing && continue
+            rng = offsets[i]+1 : offsets[i]+lengths[i]
+            gvec[rng] .= vec(g)
+        end
+        return L, gvec
+    end
+
+    iter_cb = 0
+    function fg!(F,G,v)
+        f, g = total_loss_and_grad(v)
+        F[] = f
+        G[:] = g
+        iter_cb += 1
+        if iter_cb % 10 == 0
+            mP=0.0; mQ=0.0
+            for s in samples
+                _,ΔP,ΔQ,_ = physics_loss(s, model, A, Ybus, idx, masks, non_ref_idx, pq_idx; training=false)
+                !isempty(ΔP) && (mP=max(mP, maximum(abs.(ΔP))))
+                !isempty(ΔQ) && (mQ=max(mQ, maximum(abs.(ΔQ))))
+            end
+            println("[LBFGS iter $(iter_cb)] loss=$(round(f,digits=10))  ΔP_max=$(round(mP,digits=8))  ΔQ_max=$(round(mQ,digits=8))")
+            if mP < 1e-3 && mQ < 1e-3
+                println("[LBFGS] 提前停止：达到阈值")
+                return true
+            end
+        end
+        return false
+    end
+
+    v0 = pack()
+    obj = OnceDifferentiable(v -> begin F=Ref(zero(T)); G=zeros(T,length(v)); fg!(F,G,v); F[]
+             end,
+             (G,v)->begin F=Ref(zero(T)); fg!(F,G,v); end,
+             v0)
+    options = Optim.Options(iterations = max_iter, show_trace=false)
+    solver = HAS_LINESEARCHES ? LBFGS(linesearch=LineSearches.BackTracking()) : LBFGS()
+    res = optimize(obj, v0, solver, options)
+    unpack!(Optim.minimizer(res))
+    println("[LBFGS] 完成：final loss = $(Optim.minimum(res))")
+end
+
+#---------------- 评估 ----------------#
+function evaluate(model, samples, Ybus, A, idx, aux)
+    non_ref_idx = aux.non_ref_idx
+    pq_idx      = aux.pq_idx
+    masks       = aux.masks
+    ΔP_all=T[]; ΔQ_all=T[]
+    v_err=T[]; qpv_err=T[]; ang_err=T[]; pslack_err=T[]
+    for s in samples
+        _,ΔP,ΔQ,extra = physics_loss(s, model, A, Ybus, idx, masks, non_ref_idx, pq_idx; training=false)
+        append!(ΔP_all, T.(ΔP))
+        append!(ΔQ_all, T.(ΔQ))
+        for b in idx.pq
+            push!(v_err, extra[:Vmag][b] - s.V_spec[b])
+        end
+        for b in idx.pv
+            push!(qpv_err, extra[:Qpv_calc][b] - s.Q_spec[b])
+        end
+        for b in union(idx.pq, idx.pv)
+            push!(ang_err, extra[:δ][b] - s.δ_true[b])
+        end
+        push!(pslack_err, extra[:Pslack_calc] - s.P_slack_true)
+    end
+    rmse(x)=sqrt(mean(abs2,x))
+    Dict(
+        :rmse_ΔP => rmse(ΔP_all),
+        :rmse_ΔQ => rmse(ΔQ_all),
+        :max_ΔP  => isempty(ΔP_all) ? 0 : maximum(abs.(ΔP_all)),
+        :max_ΔQ  => isempty(ΔQ_all) ? 0 : maximum(abs.(ΔQ_all)),
+        :rmse_Vpq => rmse(v_err),
+        :rmse_Qpv => isempty(qpv_err) ? 0 : rmse(qpv_err),
+        :rmse_angle => rmse(ang_err),
+        :rmse_Pslack => rmse(pslack_err)
+    )
+end
+
+#---------------- 主流程 ----------------#
+function run_training(; case_file::String,
+                        total_samples::Int=600,
+                        load_scale_range=(0.9,1.1),
+                        voltage_filter=(0.85,1.2),
+                        seed=42,
+                        use_lbfgs::Bool=USE_LBFGS_DEF)
+    @info "生成样本..."
+    # raw_samples, Ybus, A_f32, idx, baseMVA, _ =
+        # generate_upinn_samples_tspf_for_training(case_file;
+        #     total_samples=total_samples,
+        #     load_scale_range=load_scale_range,
+        #     voltage_filter=voltage_filter,
+        #     seed=seed,
+        #     keep_legacy_tensor=false)
+    raw_samples, Ybus, A_f32, idx, baseMVA, _ =
+        generate_upinn_samples_presolve(case_file;
+            total_samples=total_samples,
+            load_scale_range=load_scale_range,
+            seed=seed,
+            keep_legacy_tensor=false,
+            perturb_genP=false   # 如需随机发电设定改 true
+        )
+    samples = DatasetSample[]
+    for s in raw_samples
+        push!(samples, DatasetSample(
+            T.(s.feat),
+            T.(s.P_spec),
+            T.(s.Q_spec),
+            T.(s.V_spec),
+            T.(s.δ_true),
+            T.(s.Q_PV_true),
+            T(s.P_slack_true),
+            s.bus_types,
+            s.V_true
+        ))
+    end
+    A = SparseMatrixCSC{T,Int}(A_f32)
+    println("样本数=$(length(samples))  PQ=$(length(idx.pq)) PV=$(length(idx.pv)) Slack=$(length(idx.ref)) baseMVA=$baseMVA")
+
+    model = UPINNModel(size(samples[1].feat,2))
+
+    @info "阶段1 Adam 训练..."
+    aux = train_adam!(model, samples, Ybus, A, idx)
+
+    if use_lbfgs
+        @info "阶段2 LBFGS 精调..."
+        lbfgs_refine!(model, samples, Ybus, A, idx, aux)
+    else
+        println("跳过 LBFGS 精调。")
+    end
+
+    @info "评估..."
+    metrics = evaluate(model, samples, Ybus, A, idx, aux)
+    println("==== 评估指标 ====")
+    for (k,v) in metrics
+        println(rpad(String(k),14), " : ", v)
+    end
+    return model, metrics, aux
+end
+
+
     
-    # 如果输入输出维度不同，需要投影
-    shortcut = in_dim == out_dim ? identity : FCN(in_dim, out_dim, σ=identity)
-    
-    return ResidualBlock(main_path, shortcut, σ)
-end
-
-function (rb::ResidualBlock)(x)
-    return rb.σ.(rb.main_path(x) + rb.shortcut(x))
-end
-
-Flux.@functor ResidualBlock (main_path, shortcut,)
-
-# 4. Beta缩放层实现
-struct BetaScaling
-    beta::Vector{Float32}
-end
-
-function BetaScaling(output_dim::Int; init_value::Float32=1.0f0)
-    return BetaScaling(fill(init_value, output_dim))
-end
-
-function (bs::BetaScaling)(x)
-    return x .* bs.beta'
-end
-
-Flux.@functor BetaScaling
-
-# 创建全连接网络（带残差连接和Beta缩放）
-function create_fc_network_with_residual(enhanced_features_y)
-    # 创建残差块
-    res_block1 = ResidualBlock(enhanced_features_y, 64)
-    res_block2 = ResidualBlock(64, 32)
-    
-    # 最后一个全连接层
-    fc3 = FCN(32, 2, σ=identity)  # 输出层通常不使用激活函数
-    
-    # 用于残差连接的投影（从输入直接到输出）
-    projection = FCN(enhanced_features_y, 2, σ=identity)
-    
-    # Beta缩放
-    beta_scaling = BetaScaling(2)
-    
-    return res_block1, res_block2, fc3, projection, beta_scaling
-end
-
-
-# 构建损失函数
-function calculate_loss(ΔP, ΔQ, pv_idx, ref_idx)
-    # 初始化
-    ω_p = ones(size(ΔP,1))
-    ω_q = ones(size(ΔQ,1))
-
-    ω_p[ref_idx] .= 0
-    ω_q[ref_idx] .= 0
-    ω_q[pv_idx] .= 0
-
-    n = length(ΔP) + length(ΔQ)
-
-    L = (sum(ω_p.*ΔP.^2) + sum(ω_q.*ΔQ.^2))/n
-
-    return L, ω_p, ω_q
-end
-
-function calculate_the_deviation(pq_idx, pv_idx, ref_idx, Ybus, V)
-    # 计算雅可比矩阵
-    dSbus_dVa, dSbus_dVm = PowerFlow.dSbus_dV(Ybus, V)
-    dP_dV = real.(dSbus_dVm)
-    dP_dδ = real.(dSbus_dVa)
-    dQ_dV = imag.(dSbus_dVm)
-    dQ_dδ = real.(dSbus_dVa)
-
-    # dP_dV
-    dP_dV_pq_pq =  dP_dV[pq_idx, :]
-    dP_dV_pq_pq =  dP_dV_pq_pq[:, pq_idx]
-
-    dP_dV_pv_pq = dP_dV[pv_idx, :]
-    dP_dV_pv_pq = dP_dV_pv_pq[:, pq_idx]
-
-    dP_dV_ref_pq = spzeros(1, length(pq_idx))
-
-    # dP_dδ
-    dP_dδ_pq_pq = dP_dδ[pq_idx, :]
-    dP_dδ_pq_pq = dP_dδ_pq_pq[:, pq_idx]
-    dP_dδ_pq_pv = dP_dδ[pq_idx, :]
-    dP_dδ_pq_pv = dP_dδ_pq_pv[:, pv_idx]
-
-    dP_dδ_pv_pq = dP_dδ[pv_idx, :]
-    dP_dδ_pv_pq = dP_dδ_pv_pq[:, pq_idx]
-    dP_dδ_pv_pv = dP_dδ[pv_idx, :]
-    dP_dδ_pv_pv = dP_dδ_pv_pv[:, pv_idx]
-
-    dP_dδ_ref_pq = spzeros(1, length(pq_idx))
-    dP_dδ_ref_pv = spzeros(1, length(pv_idx))
-
-    # dP_dPn
-    dP_dPn_pq_ref = zeros(length(pq_idx),1)
-    dP_dPn_pv_ref = zeros(length(pv_idx),1)
-    dP_dPn_ref_ref = -ones(length(ref_idx),1)
-
-    # dP_dQ
-    dP_dQ_pq_pv = zeros(length(pq_idx),length(pv_idx))
-    dP_dQ_pq_ref = zeros(length(pq_idx),length(ref_idx))
-    dP_dQ_pv_pv = zeros(length(pv_idx),length(pv_idx))
-    dP_dQ_pv_ref = zeros(length(pv_idx),length(ref_idx))
-    dP_dQ_ref_pv = zeros(length(ref_idx),length(pv_idx))
-    dP_dQ_ref_ref = zeros(length(ref_idx),1)
-
-    # dQ_dV
-    dQ_dV_pq_pq =  dQ_dV[pq_idx, :]
-    dQ_dV_pq_pq =  dQ_dV_pq_pq[:, pq_idx]
-
-    dQ_dV_pv_pq = spzeros(length(pv_idx), length(pq_idx))
-
-    dQ_dV_ref_pq = spzeros(1, length(pq_idx))
-
-    # dQ_dδ
-    dQ_dδ_pq_pq = dQ_dδ[pq_idx, :]
-    dQ_dδ_pq_pq = dQ_dδ_pq_pq[:, pq_idx]
-    dQ_dδ_pq_pv = dQ_dδ[pq_idx, :]
-    dQ_dδ_pq_pv = dQ_dδ_pq_pv[:, pv_idx]
-
-    dQ_dδ_pv_pq = spzeros(length(pv_idx), length(pq_idx))
-    dQ_dδ_pv_pv = spzeros(length(pv_idx), length(pv_idx))
-
-    dQ_dδ_ref_pq = spzeros(1, length(pq_idx))
-    dQ_dδ_ref_pv = spzeros(1, length(pv_idx))
-
-    # dQ_dPn
-    dQ_dPn_pq_ref = spzeros(length(pq_idx), 1)
-    dQ_dPn_pv_ref = spzeros(length(pv_idx), 1)
-    dQ_dPn_ref_ref = spzeros(length(ref_idx), 1)
-
-    # dQ_dQ
-    dQ_dQ_pq_pv = spzeros(length(pq_idx), length(pv_idx))
-    dQ_dQ_pq_ref = spzeros(length(pq_idx), length(ref_idx))
-
-    dQ_dQ_pv_pv = spdiagm(0 => -ones(length(pv_idx)))
-    dQ_dQ_pv_ref = spzeros(length(pv_idx), length(ref_idx))
-
-    dQ_dQ_ref_pv = spzeros(length(ref_idx), length(pv_idx))
-    dQ_dQ_ref_ref = spdiagm(0 => -ones(length(ref_idx)))
-
-    # 拼接矩阵
-    J = [dP_dV_pq_pq dP_dδ_pq_pq dP_dδ_pq_pv dP_dPn_pq_ref dP_dQ_pq_pv dP_dQ_pq_ref;
-     dP_dV_pv_pq dP_dδ_pv_pq dP_dδ_pv_pv dP_dPn_pv_ref dP_dQ_pv_pv dP_dQ_pv_ref;
-     dP_dV_ref_pq dP_dδ_ref_pq dP_dδ_ref_pv dP_dPn_ref_ref dP_dQ_ref_pv dP_dQ_ref_ref;
-     dQ_dV_pq_pq dQ_dδ_pq_pq dQ_dδ_pq_pv dQ_dPn_pq_ref dQ_dQ_pq_pv dQ_dQ_pq_ref;
-     dQ_dV_pv_pq dQ_dδ_pv_pq dQ_dδ_pv_pv dQ_dPn_pv_ref dQ_dQ_pv_pv dQ_dQ_pv_ref;
-     dQ_dV_ref_pq dQ_dδ_ref_pq dQ_dδ_ref_pv dQ_dPn_ref_ref dQ_dQ_ref_pv dQ_dQ_ref_ref
-     ]
-
-    return J
-end
-
-function calculate_chain_deviation(J, pv_idx, pq_idx, ref_idx, ΔP, ΔQ, ω_p, ω_q)
-    n = length(pq_idx) + length(pv_idx) + length(ref_idx)
-    P_vector = (ω_p./n).* ΔP
-    Q_vector = (ω_q./n).* ΔQ
-    mismatch = vcat(P_vector, Q_vector)
-    deviation = mismatch' * J
-
-    return deviation
-end
