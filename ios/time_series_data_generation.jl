@@ -1,13 +1,3 @@
-# ====================================================================================
-# IEEE 37 Feeder 24小时(0.1s步长)时间序列仿真脚本 (整合扩展修正版 - 兼容无 Bus1 属性 + 分相注入)
-#
-# 新增（2025-09-23, 更新补丁 2025-09-23-B）:
-# - 支持分相注入功率记录
-# - 修复: _element_phase_powers 处理 CktElement.Powers() 返回 Complex 数组时报 InexactError
-# - 修复 delta :equal 分配时 Pph[3] 赋值错误
-#
-# ====================================================================================
-
 using OpenDSSDirect
 using DataFrames
 using Statistics
@@ -1268,15 +1258,3 @@ if abspath(PROGRAM_FILE) == @__FILE__
         println("  julia $(PROGRAM_FILE) \"D:/path/to/ieee37\" 0.1 24 100")
     end
 end
-
-# # ====================================================================================
-# # REPL 快速测试 (可注释)
-# # ====================================================================================
-# feeder_dir = "D:/luosipeng/Deep_Learning_in_Distribution_System/data"
-# res = time_series_ieee37(feeder_dir; dt_s=0.1, hours=0.02, sample_every=1,
-#     collect=[:voltage_bus, :bus_injection],
-#     per_phase_injection=true, delta_method=:equal)
-# s_pmu = get_bus_series(res, "705")
-# inj728 = get_bus_phase_injection(res, "728")
-# @show inj728["P_inj_phase_kW"][:,1:5]
-# # ====================================================================================
