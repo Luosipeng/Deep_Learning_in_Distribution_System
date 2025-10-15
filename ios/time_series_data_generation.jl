@@ -1026,10 +1026,27 @@ function time_series_ieee37(feeder_dir::String;
                             save_phase::Bool=true,
                             store_angle::Bool=true,
                             per_phase_injection::Bool=true,
-                            delta_method::Symbol=:equal)
+                            delta_method::Symbol=:equal,
+                            extract_ymatrix::Bool=true)  # 新增参数
     println("加载 IEEE 37 初始工况...")
     conv, info = load_ieee37(feeder_dir)
     println("初始收敛 = $(info["converged"]), 总功率(MW,Mvar) = $(info["total_power_MW_Mvar"])")
+
+    # 提取导纳矩阵（在修改网络之前）
+    ymatrix_info = nothing
+    if extract_ymatrix
+        println("提取系统导纳矩阵...")
+        try
+            ymatrix_info = get_system_ymatrix()
+            println("导纳矩阵维度: $(ymatrix_info["matrix_size"])")
+            println("参考节点: $(ymatrix_info["slack_bus"]) (索引: $(ymatrix_info["slack_index"]))")
+            if ymatrix_info["is_sparse"]
+                println("矩阵稀疏度: $(ymatrix_info["sparsity"])")
+            end
+        catch e
+            @warn "提取导纳矩阵失败: $e"
+        end
+    end
 
     println("生成并注册各负荷 LoadShape ...")
     df_shapes = build_load_shapes(dt_s=dt_s, hours=hours, pf_mode=pf_mode, shape_dir=shape_dir)
@@ -1051,7 +1068,7 @@ function time_series_ieee37(feeder_dir::String;
     tel = time() - t0
     println("仿真完成，耗时 $(round(tel,digits=2)) 秒 (≈ $(round(tel/60,digits=2)) 分).")
 
-    return Dict(
+    result = Dict(
         "shapes"=>df_shapes,
         "result"=>res_core,
         "meta"=>Dict("dt_s"=>dt_s,
@@ -1063,6 +1080,13 @@ function time_series_ieee37(feeder_dir::String;
                      "delta_method"=>String(delta_method),
                      "timestamp"=>string(Dates.now()))
     )
+    
+    # 添加导纳矩阵信息
+    if ymatrix_info !== nothing
+        result["ymatrix"] = ymatrix_info
+    end
+    
+    return result
 end
 
 # ====================================================================================
@@ -1257,4 +1281,562 @@ if abspath(PROGRAM_FILE) == @__FILE__
         println("未提供 feeder_dir，脚本未执行主流程。用法示例：")
         println("  julia $(PROGRAM_FILE) \"D:/path/to/ieee37\" 0.1 24 100")
     end
+end
+
+# ====================================================================================
+# 导纳矩阵提取
+# ====================================================================================
+
+"""
+    get_node_to_bus_mapping()
+
+获取节点到母线的映射关系
+"""
+function get_node_to_bus_mapping()
+    all_buses = OpenDSSDirect.Circuit.AllBusNames()
+    all_nodes = OpenDSSDirect.Circuit.AllNodeNames()
+    
+    @info "系统信息: $(length(all_buses)) 个母线, $(length(all_nodes)) 个节点"
+    
+    # 构建节点到母线的映射
+    node_to_bus = Dict{String, String}()
+    bus_to_nodes = Dict{String, Vector{String}}()
+    
+    for node in all_nodes
+        # 节点名称格式: "bus.phase" 或 "bus"
+        parts = split(node, ".")
+        bus_name = parts[1]
+        
+        node_to_bus[node] = bus_name
+        
+        if !haskey(bus_to_nodes, bus_name)
+            bus_to_nodes[bus_name] = String[]
+        end
+        push!(bus_to_nodes[bus_name], node)
+    end
+    
+    return node_to_bus, bus_to_nodes, all_nodes
+end
+
+
+"""
+    aggregate_ymatrix_to_bus_level(Y_node, all_nodes, node_to_bus, buses_to_keep)
+
+将节点级导纳矩阵聚合为母线级导纳矩阵
+"""
+function aggregate_ymatrix_to_bus_level(Y_node, all_nodes, node_to_bus, buses_to_keep)
+    
+    # 创建节点索引
+    node_index = Dict(node => i for (i, node) in enumerate(all_nodes))
+    
+    # 过滤出需要保留的节点
+    nodes_to_keep = String[]
+    for node in all_nodes
+        bus = get(node_to_bus, node, "")
+        if bus in buses_to_keep
+            push!(nodes_to_keep, node)
+        end
+    end
+    
+    @info "保留 $(length(nodes_to_keep)) 个节点（对应 $(length(buses_to_keep)) 个母线）"
+    
+    # 提取对应的子矩阵
+    keep_indices = [node_index[node] for node in nodes_to_keep]
+    Y_sub = Y_node[keep_indices, keep_indices]
+    
+    @info "提取子矩阵: $(size(Y_sub))"
+    
+    # 构建母线到节点索引的映射
+    bus_to_node_indices = Dict{String, Vector{Int}}()
+    for (i, node) in enumerate(nodes_to_keep)
+        bus = node_to_bus[node]
+        if !haskey(bus_to_node_indices, bus)
+            bus_to_node_indices[bus] = Int[]
+        end
+        push!(bus_to_node_indices[bus], i)
+    end
+    
+    # 聚合到母线级别
+    nb = length(buses_to_keep)
+    Y_bus = zeros(ComplexF64, nb, nb)
+    
+    for (i, bus_i) in enumerate(buses_to_keep)
+        node_indices_i = get(bus_to_node_indices, bus_i, Int[])
+        
+        for (j, bus_j) in enumerate(buses_to_keep)
+            node_indices_j = get(bus_to_node_indices, bus_j, Int[])
+            
+            # 对所有相的导纳求和
+            y_sum = 0.0 + 0.0im
+            for ni in node_indices_i
+                for nj in node_indices_j
+                    y_sum += Y_sub[ni, nj]
+                end
+            end
+            
+            Y_bus[i, j] = y_sum
+        end
+    end
+    
+    return Y_bus, nodes_to_keep
+end
+
+"""
+    get_system_ymatrix(; 
+        exclude_source_bus::Bool=true,
+        merge_regulators::Bool=true)
+
+提取系统导纳矩阵
+"""
+function get_system_ymatrix(; 
+    exclude_source_bus::Bool=true,
+    merge_regulators::Bool=true)
+    
+    try
+        # 1. 获取节点级导纳矩阵
+        Y_raw = OpenDSSDirect.Circuit.SystemY()
+        
+        # 2. 获取节点和母线信息
+        node_to_bus, bus_to_nodes, all_nodes = get_node_to_bus_mapping()
+        all_buses = OpenDSSDirect.Circuit.AllBusNames()
+        
+        @info "OpenDSS 返回: $(length(all_buses)) 个母线, $(length(all_nodes)) 个节点"
+        
+        # 3. 解析导纳矩阵
+        Y_node = if Y_raw isa Matrix{<:Complex}
+            Y_raw
+        elseif Y_raw isa AbstractVector{<:Complex}
+            n = Int(sqrt(length(Y_raw)))
+            reshape(Y_raw, n, n)
+        elseif Y_raw isa AbstractVector{<:Real}
+            len = length(Y_raw)
+            n_elements = len ÷ 2
+            n = Int(sqrt(n_elements))
+            Y_complex = [complex(Y_raw[2i-1], Y_raw[2i]) for i in 1:n_elements]
+            reshape(Y_complex, n, n)
+        else
+            error("未知的 SystemY 返回类型: $(typeof(Y_raw))")
+        end
+        
+        @info "节点级导纳矩阵维度: $(size(Y_node))"
+        
+        # 验证维度
+        if size(Y_node, 1) != length(all_nodes)
+            @error "节点数不匹配: 矩阵 $(size(Y_node)) vs 节点 $(length(all_nodes))"
+            error("导纳矩阵维度与节点数不匹配")
+        end
+        
+        # 4. 确定要保留的母线
+        excluded_buses = String[]
+        if exclude_source_bus
+            for bus in all_buses
+                if bus == "sourcebus"
+                    push!(excluded_buses, bus)
+                    @info "排除高压侧母线: $bus"
+                end
+            end
+        end
+        
+        buses_to_keep = filter(b -> !(b in excluded_buses), all_buses)
+        @info "保留 $(length(buses_to_keep)) 个配电网母线"
+        
+        # 5. 聚合到母线级别
+        Y_bus, nodes_kept = aggregate_ymatrix_to_bus_level(
+            Y_node, all_nodes, node_to_bus, buses_to_keep
+        )
+        
+        @info "母线级导纳矩阵维度: $(size(Y_bus))"
+        
+        # 6. 查找平衡节点
+        slack_bus = "799"
+        slack_index = findfirst(==(slack_bus), buses_to_keep)
+        
+        if slack_index === nothing
+            @warn "未找到母线 799，使用第一个母线作为平衡节点"
+            slack_bus = buses_to_keep[1]
+            slack_index = 1
+        else
+            @info "找到配电网参考节点: $slack_bus (索引 $slack_index)"
+        end
+        
+        # 7. 合并调压器母线（799 和 799r）
+        if merge_regulators
+            @info "\n开始合并调压器母线..."
+            Y_bus, buses_to_keep, slack_bus = merge_regulator_buses(
+                Y_bus, buses_to_keep, slack_bus
+            )
+            slack_index = findfirst(==(slack_bus), buses_to_keep)
+        end
+        
+        # 8. 计算稀疏性
+        n_elements = length(Y_bus)
+        n_nonzero = count(x -> abs(x) > 1e-12, Y_bus)
+        sparsity = 1.0 - n_nonzero / n_elements
+        
+        # 9. 打印结果
+        println("\n" * "="^60)
+        println("配电网母线列表:")
+        println("="^60)
+        for (i, bus) in enumerate(buses_to_keep)
+            marker = (bus == slack_bus) ? " ⭐ [平衡节点]" : ""
+            n_nodes = length(get(bus_to_nodes, bus, []))
+            println("  $i. $bus ($(n_nodes)相)$marker")
+        end
+        
+        println("\n" * "="^60)
+        println("导纳矩阵信息:")
+        println("="^60)
+        println("  节点级矩阵: $(size(Y_node))")
+        println("  母线级矩阵: $(size(Y_bus))")
+        println("  母线数: $(length(buses_to_keep))")
+        println("  平衡节点: $slack_bus (索引 $slack_index)")
+        println("  稀疏度: $(round(sparsity * 100, digits=2))%")
+        println("  非零元素: $n_nonzero / $n_elements")
+        println("="^60)
+        
+        return Dict(
+            "Y_matrix" => Y_bus,
+            "Y_node" => Y_node,
+            "buses" => buses_to_keep,
+            "all_buses" => all_buses,
+            "all_nodes" => all_nodes,
+            "nodes_kept" => nodes_kept,
+            "excluded_buses" => excluded_buses,
+            "slack_bus" => slack_bus,
+            "slack_index" => slack_index,
+            "matrix_size" => size(Y_bus),
+            "node_matrix_size" => size(Y_node),
+            "num_buses" => length(buses_to_keep),
+            "num_all_buses" => length(all_buses),
+            "num_nodes" => length(nodes_kept),
+            "num_all_nodes" => length(all_nodes),
+            "is_sparse" => sparsity > 0.5,
+            "sparsity" => round(sparsity, digits=4),
+            "nonzero_elements" => n_nonzero,
+            "bus_to_nodes" => bus_to_nodes,
+            "node_to_bus" => node_to_bus,
+            "timestamp" => string(Dates.now())
+        )
+        
+    catch e
+        @error "提取导纳矩阵失败: $e"
+        @error "错误堆栈: " exception=(e, catch_backtrace())
+        rethrow(e)
+    end
+end
+
+
+"""
+    build_ymatrix_manually()
+
+手动构建系统导纳矩阵（备用方法）
+"""
+function build_ymatrix_manually()
+    buses = OpenDSSDirect.Circuit.AllBusNames()
+    nb = length(buses)
+    bus_index = Dict(b => i for (i, b) in enumerate(buses))
+    
+    # 初始化导纳矩阵
+    Y = zeros(ComplexF64, nb, nb)
+    
+    # 遍历所有线路，添加导纳
+    lines = OpenDSSDirect.Lines.AllNames()
+    for ln in lines
+        try
+            OpenDSSDirect.Lines.Name(ln)
+            bus1 = _basebus(OpenDSSDirect.Lines.Bus1())
+            bus2 = _basebus(OpenDSSDirect.Lines.Bus2())
+            
+            i1 = get(bus_index, bus1, 0)
+            i2 = get(bus_index, bus2, 0)
+            
+            if i1 == 0 || i2 == 0
+                continue
+            end
+            
+            # 获取线路参数
+            R1 = try OpenDSSDirect.Lines.R1() catch; 0.0 end
+            X1 = try OpenDSSDirect.Lines.X1() catch; 0.0 end
+            length_km = try OpenDSSDirect.Lines.Length() catch; 1.0 end
+            
+            # 计算阻抗和导纳
+            Z = (R1 + im * X1) * length_km
+            if abs(Z) > 1e-10
+                y = 1.0 / Z
+                
+                # 添加到导纳矩阵
+                Y[i1, i1] += y
+                Y[i2, i2] += y
+                Y[i1, i2] -= y
+                Y[i2, i1] -= y
+            end
+        catch e
+            @warn "处理线路 $ln 时出错: $e"
+        end
+    end
+    
+    # 添加对地导纳（电容、负荷等）
+    # 这里简化处理，实际可能需要更复杂的逻辑
+    
+    # 查找参考节点
+    slack_bus = ""
+    slack_index = 0
+    vsources = try OpenDSSDirect.Vsources.AllNames() catch; String[] end
+    if !isempty(vsources)
+        try
+            OpenDSSDirect.Vsources.Name(vsources[1])
+            dsscmd("Select Vsource.$(vsources[1])")
+            bus_names = OpenDSSDirect.CktElement.BusNames()
+            if !isempty(bus_names)
+                slack_bus = _basebus(bus_names[1])
+                slack_index = get(bus_index, slack_bus, 1)
+            end
+        catch
+        end
+    end
+    
+    if slack_index == 0
+        slack_bus = buses[1]
+        slack_index = 1
+    end
+    
+    return Dict(
+        "Y_matrix" => Y,
+        "buses" => buses,
+        "slack_bus" => slack_bus,
+        "slack_index" => slack_index,
+        "matrix_size" => size(Y),
+        "is_sparse" => false,
+        "method" => "manual",
+        "timestamp" => string(Dates.now())
+    )
+end
+
+
+"""
+    analyze_ieee37_topology()
+
+分析 IEEE 37 系统的拓扑结构
+"""
+function analyze_ieee37_topology()
+    println("="^60)
+    println("IEEE 37 节点系统拓扑分析")
+    println("="^60)
+    
+    # 1. 检查电压源
+    println("\n【1. 电压源 (Vsource)】")
+    vsources = OpenDSSDirect.Vsources.AllNames()
+    for vs in vsources
+        OpenDSSDirect.Vsources.Name(vs)
+        dsscmd("Select Vsource.$vs")
+        bus_names = OpenDSSDirect.CktElement.BusNames()
+        println("  Vsource.$vs")
+        println("    连接母线: $(join(bus_names, ", "))")
+        println("    基准母线: $(_basebus(bus_names[1]))")
+    end
+    
+    # 2. 检查变压器（substation transformer）
+    println("\n【2. 变压器 (Transformer)】")
+    transformers = OpenDSSDirect.Transformers.AllNames()
+    for tr in transformers
+        OpenDSSDirect.Transformers.Name(tr)
+        dsscmd("Select Transformer.$tr")
+        bus_names = OpenDSSDirect.CktElement.BusNames()
+        println("  Transformer.$tr")
+        println("    一次侧: $(bus_names[1]) -> $(_basebus(bus_names[1]))")
+        if length(bus_names) > 1
+            println("    二次侧: $(bus_names[2]) -> $(_basebus(bus_names[2]))")
+        end
+        
+        # 标记特殊变压器
+        if occursin("sub", lowercase(tr))
+            println("    ⭐ 变电站主变压器")
+        elseif occursin("reg", lowercase(tr))
+            println("    🔧 调压器变压器")
+        end
+    end
+    
+    # 3. 检查调压器控制器
+    println("\n【3. 调压器控制 (RegControl)】")
+    try
+        regcontrols = OpenDSSDirect.RegControls.AllNames()
+        for reg in regcontrols
+            OpenDSSDirect.RegControls.Name(reg)
+            println("  RegControl.$reg")
+            # 注意：RegControl 本身不是电气元件，只是控制器
+        end
+    catch e
+        @warn "无法访问 RegControls: $e"
+    end
+    
+    # 4. 检查从 sourcebus 和 799 出发的线路
+    println("\n【4. 关键母线的线路连接】")
+    lines = OpenDSSDirect.Lines.AllNames()
+    
+    println("\n  从 sourcebus 出发的线路:")
+    count_source = 0
+    for ln in lines
+        OpenDSSDirect.Lines.Name(ln)
+        bus1 = _basebus(OpenDSSDirect.Lines.Bus1())
+        bus2 = _basebus(OpenDSSDirect.Lines.Bus2())
+        if bus1 == "sourcebus" || bus2 == "sourcebus"
+            println("    Line.$ln: $bus1 <-> $bus2")
+            count_source += 1
+        end
+    end
+    if count_source == 0
+        println("    ⚠️  无线路连接（sourcebus 仅通过变压器连接）")
+    end
+    
+    println("\n  从 799 出发的线路:")
+    count_799 = 0
+    for ln in lines
+        OpenDSSDirect.Lines.Name(ln)
+        bus1 = _basebus(OpenDSSDirect.Lines.Bus1())
+        bus2 = _basebus(OpenDSSDirect.Lines.Bus2())
+        if bus1 == "799" || bus2 == "799"
+            println("    Line.$ln: $bus1 <-> $bus2")
+            count_799 += 1
+        end
+    end
+    
+    println("\n  从 799r 出发的线路:")
+    count_799r = 0
+    for ln in lines
+        OpenDSSDirect.Lines.Name(ln)
+        bus1 = _basebus(OpenDSSDirect.Lines.Bus1())
+        bus2 = _basebus(OpenDSSDirect.Lines.Bus2())
+        if bus1 == "799r" || bus2 == "799r"
+            println("    Line.$ln: $bus1 <-> $bus2")
+            count_799r += 1
+        end
+    end
+    
+    # 5. 拓扑总结
+    println("\n" * "="^60)
+    println("【拓扑总结】")
+    println("="^60)
+    
+    all_buses = OpenDSSDirect.Circuit.AllBusNames()
+    println("总母线数: $(length(all_buses))")
+    
+    # 分类母线
+    println("\n母线分类:")
+    println("  1. sourcebus - 高压侧母线（变电站一次侧）")
+    println("  2. 799 - 配电网参考节点（变电站二次侧）")
+    println("  3. 799r - 调压器次级侧母线")
+    println("  4. 其他 $(length(all_buses) - 3) 个配电网母线")
+    
+    # 判断真正的平衡节点
+    println("\n【平衡节点判断】")
+    println("  ✓ sourcebus: 高压侧，不属于配电网")
+    println("  ✓ 799: 配电网的参考节点（平衡节点）")
+    println("  ✓ 799r: 调压器次级侧，属于配电网")
+    println("\n  结论:")
+    println("    - IEEE 37 的 '37 个节点' 不包括 sourcebus")
+    println("    - 应该包括 799r（真实的电气节点）")
+    println("    - 实际配电网节点数: $(length(all_buses) - 1) (排除 sourcebus)")
+    println("    - 平衡节点: 799")
+    
+    return Dict(
+        "all_buses" => all_buses,
+        "num_all_buses" => length(all_buses),
+        "sourcebus_line_count" => count_source,
+        "bus799_line_count" => count_799,
+        "bus799r_line_count" => count_799r,
+        "recommended_slack" => "799",
+        "exclude_buses" => ["sourcebus"]
+    )
+end
+
+"""
+    merge_regulator_buses(Y_matrix, buses, slack_bus)
+
+合并调压器的一次侧和二次侧母线（通过 jumper 连接的母线）。
+
+对于 IEEE 37:
+- 799 和 799r 通过 jumper 短接，应合并为一个节点 799
+- 合并后从 38 个节点变为 37 个节点
+"""
+function merge_regulator_buses(Y_matrix, buses, slack_bus)
+    
+    # 查找需要合并的母线对
+    merge_pairs = []
+    
+    # 检查所有 jumper 线路
+    lines = OpenDSSDirect.Lines.AllNames()
+    for ln in lines
+        if occursin("jumper", lowercase(ln))
+            OpenDSSDirect.Lines.Name(ln)
+            bus1 = _basebus(OpenDSSDirect.Lines.Bus1())
+            bus2 = _basebus(OpenDSSDirect.Lines.Bus2())
+            
+            # 检查是否是调压器相关的 jumper
+            if (bus1 == "799" && bus2 == "799r") || (bus1 == "799r" && bus2 == "799")
+                push!(merge_pairs, (bus1, bus2))
+                @info "发现需要合并的母线对: $bus1 <-> $bus2 (jumper)"
+            end
+        end
+    end
+    
+    if isempty(merge_pairs)
+        @warn "未找到需要合并的母线对，返回原始矩阵"
+        return Y_matrix, buses, slack_bus
+    end
+    
+    # 对每一对需要合并的母线进行处理
+    Y_merged = copy(Y_matrix)
+    buses_merged = copy(buses)
+    
+    for (bus_keep, bus_remove) in merge_pairs
+        # 确定保留哪个母线（保留不带 'r' 的）
+        if endswith(bus_keep, "r")
+            bus_keep, bus_remove = bus_remove, bus_keep
+        end
+        
+        @info "合并母线: $bus_remove -> $bus_keep"
+        
+        # 查找母线索引
+        idx_keep = findfirst(==(bus_keep), buses_merged)
+        idx_remove = findfirst(==(bus_remove), buses_merged)
+        
+        if idx_keep === nothing || idx_remove === nothing
+            @warn "未找到母线索引: $bus_keep=$idx_keep, $bus_remove=$idx_remove"
+            continue
+        end
+        
+        @info "  母线索引: $bus_keep=$idx_keep, $bus_remove=$idx_remove"
+        
+        # 合并导纳矩阵
+        # 将 bus_remove 的行和列加到 bus_keep 上
+        Y_merged[idx_keep, :] .+= Y_merged[idx_remove, :]
+        Y_merged[:, idx_keep] .+= Y_merged[:, idx_remove]
+        
+        # 注意：对角元素被加了两次，需要减去一次
+        Y_merged[idx_keep, idx_keep] -= Y_merged[idx_remove, idx_remove]
+        
+        # 删除 bus_remove 对应的行和列
+        keep_indices = setdiff(1:size(Y_merged, 1), idx_remove)
+        Y_merged = Y_merged[keep_indices, keep_indices]
+        
+        # 从母线列表中删除 bus_remove
+        deleteat!(buses_merged, idx_remove)
+        
+        @info "  合并后矩阵维度: $(size(Y_merged))"
+    end
+    
+    # 更新 slack_bus 索引
+    slack_bus_merged = slack_bus
+    slack_index_merged = findfirst(==(slack_bus_merged), buses_merged)
+    
+    if slack_index_merged === nothing
+        @warn "平衡节点 $slack_bus 在合并后未找到"
+        slack_bus_merged = buses_merged[1]
+        slack_index_merged = 1
+    end
+    
+    @info "合并完成: $(length(buses)) 个节点 -> $(length(buses_merged)) 个节点"
+    @info "平衡节点: $slack_bus_merged (索引: $slack_index_merged)"
+    
+    return Y_merged, buses_merged, slack_bus_merged
 end

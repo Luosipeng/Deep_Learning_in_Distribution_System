@@ -11,6 +11,9 @@ using Plots
 using Statistics
 using Random
 using ProgressMeter
+using DataFrames
+using JLD2
+using CSV
 
 # Set plot defaults
 gr(fontfamily="Arial", legendfontsize=7, guidefontsize=9, titlefontsize=9)
@@ -556,7 +559,8 @@ function main_multitask()
         dt_s=0.1,
         hours=24.0,
         sample_every=1,
-        collect=[:voltage_bus, :total_power, :bus_injection]
+        collect=[:voltage_bus, :total_power, :bus_injection],
+        extract_ymatrix=true
     )
     ds = extract_requested_dataset(res)
     
@@ -949,45 +953,6 @@ println("="^70)
 # Run main training
 # result = nothing
 result = main_multitask()
-
-
-# Additional analyses (only if training succeeded)
 if result !== nothing
-    println("\n[9] Additional Analyses...")
-    
-    # Correlation plot
-    try
-        plot_sensor_correlations(result, max_sensors=20)
-    catch e
-        println("  ⚠️  Correlation plot failed: $e")
-    end
-    
-    # Save detailed results
-    try
-        save_results(result)
-    catch e
-        println("  ⚠️  Failed to save results: $e")
-        println("  Stack trace:")
-        for (exc, bt) in Base.catch_stack()
-            showerror(stdout, exc, bt)
-            println()
-        end
-    end
-    
-    println("\n" * "="^70)
-    println("All analyses complete!")
-    println("="^70)
-    println("\nGenerated files:")
-    println("  - multitask_gp_predictions_full.png")
-    println("  - multitask_gp_loss_full.png")
-    println("  - multitask_gp_hyperparams_full.png")
-    println("  - multitask_gp_snr_analysis.png")
-    println("  - multitask_gp_lengthscale_analysis.png")
-    println("  - multitask_gp_correlations.png")
-    println("  - multitask_gp_results.txt")
-else
-    println("\n" * "="^70)
-    println("Training failed - no results to analyze")
-    println("="^70)
+unified_result = generate_1min_resolution_predictions(result)
 end
-
