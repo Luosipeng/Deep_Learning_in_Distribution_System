@@ -1,9 +1,10 @@
-#############################
-# Multi-task Gaussian Process - Full Sensor Version
-#############################
+# ============================================
+# Includes & Packages
+# ============================================
 
 include("../src/get_sample_from_ieee37.jl")
 include("../src/get_ieee37_multitask_data.jl")
+include("../src/implement_data.jl")
 
 using Flux
 using LinearAlgebra
@@ -15,7 +16,7 @@ using DataFrames
 using JLD2
 using CSV
 
-# Set plot defaults
+# Plot defaults
 gr(fontfamily="Arial", legendfontsize=7, guidefontsize=9, titlefontsize=9)
 
 # ============================================
@@ -38,24 +39,30 @@ struct NormalizationParams
 end
 
 # ============================================
-# Data Preprocessing
+# Helpers
 # ============================================
 
+# 纯函数：返回在对角线上加 d 的新矩阵副本（避免就地修改与 UniformScaling）
+function add_diag_copy(A::AbstractMatrix{T}, d::T) where {T<:Real}
+    Matrix{T}(A) + d * I
+end
+
+# Smart downsample
 function smart_downsample(times::Vector, values::Vector, max_points::Int=500)
     n = length(times)
     if n <= max_points
         return Float32.(times), Float32.(values)
     end
-    step = n ÷ max_points
-    indices = 1:step:n
-    return Float32.(times[indices]), Float32.(values[indices])
+    step = max(1, n ÷ max_points)
+    idx = 1:step:n
+    return Float32.(times[idx]), Float32.(values[idx])
 end
 
-"""
-Build complete multi-sensor dataset with all available sensors
-"""
+# ============================================
+# Build Dataset
+# ============================================
+
 function build_complete_multisensor_data(ds; max_points_per_sensor::Int=300)
-    
     times_list = Vector{Vector{Float32}}()
     values_list = Vector{Vector{Float32}}()
     names_list = String[]
@@ -65,38 +72,27 @@ function build_complete_multisensor_data(ds; max_points_per_sensor::Int=300)
     println("Building Complete Multi-Sensor Dataset")
     println("="^70)
     
-    # Define all sensors based on your specification
+    # Sensors (可按需调整)
     scada_sensors = [
-        # Bus 702: A, B, C phase voltage magnitude
         ("702", [:A, :B, :C], :Vmag),
-        # Bus 703: A, B, C phase voltage magnitude
         ("703", [:A, :B, :C], :Vmag),
-        # Bus 730: A, B, C phase voltage magnitude
         ("730", [:A, :B, :C], :Vmag),
     ]
-    
     ami_sensors = [
-        # Bus 701: A, B, C phase active and reactive power
         ("701", [:A, :B, :C], :P_kW),
         ("701", [:A, :B, :C], :Q_kvar),
-        # Bus 744: A phase active and reactive power
         ("744", [:A], :P_kW),
         ("744", [:A], :Q_kvar),
-        # Bus 728: A, B, C phase active and reactive power
         ("728", [:A, :B, :C], :P_kW),
         ("728", [:A, :B, :C], :Q_kvar),
-        # Bus 729: A phase active and reactive power
         ("729", [:A], :P_kW),
         ("729", [:A], :Q_kvar),
-        # Bus 736: B phase active and reactive power
         ("736", [:B], :P_kW),
         ("736", [:B], :Q_kvar),
-        # Bus 727: C phase active and reactive power
         ("727", [:C], :P_kW),
         ("727", [:C], :Q_kvar),
     ]
     
-    # Process SCADA sensors
     println("\n[SCADA Sensors]")
     scada_count = 0
     for (bus, phases, measurement) in scada_sensors
@@ -104,39 +100,26 @@ function build_complete_multisensor_data(ds; max_points_per_sensor::Int=300)
             println("  ⚠️  Skip SCADA-$bus (not found)")
             continue
         end
-        
-        for phase in phases
-            if !haskey(ds[:SCADA][bus][measurement], phase)
-                continue
-            end
-            
+        for ph in phases
+            if !haskey(ds[:SCADA][bus][measurement], ph); continue; end
             t_raw = ds[:SCADA][bus][:times]
-            v_raw = ds[:SCADA][bus][measurement][phase]
-            
+            v_raw = ds[:SCADA][bus][measurement][ph]
             t_hours = t_raw ./ 3600.0
             t, v = smart_downsample(t_hours, v_raw, max_points_per_sensor)
-            
             if std(v) < 1e-6 || !all(isfinite.(v))
-                println("  ⚠️  Skip SCADA-$bus-$phase-$measurement (invalid data)")
+                println("  ⚠️  Skip SCADA-$bus-$ph-$measurement (invalid data)")
                 continue
             end
-            
             push!(times_list, t)
             push!(values_list, v)
-            
-            # Create descriptive name
-            meas_name = measurement == :Vmag ? "Vmag" : string(measurement)
-            push!(names_list, "SCADA-$bus-$phase-$meas_name")
+            push!(names_list, "SCADA-$bus-$ph-$(measurement == :Vmag ? "Vmag" : string(measurement))")
             push!(types_list, :SCADA)
-            
             scada_count += 1
-            println("  ✓ SCADA-$bus-$phase-$meas_name: $(length(v)) points " *
-                    "(range: $(round(minimum(v), digits=2)) ~ $(round(maximum(v), digits=2)))")
+            println("  ✓ SCADA-$bus-$ph-$(measurement): $(length(v)) pts (range: $(round(minimum(v), digits=2)) ~ $(round(maximum(v), digits=2)))")
         end
     end
     println("  Total SCADA sensors: $scada_count")
     
-    # Process AMI sensors
     println("\n[AMI Sensors]")
     ami_count = 0
     for (bus, phases, measurement) in ami_sensors
@@ -144,66 +127,45 @@ function build_complete_multisensor_data(ds; max_points_per_sensor::Int=300)
             println("  ⚠️  Skip AMI-$bus (not found)")
             continue
         end
-        
-        for phase in phases
-            if !haskey(ds[:AMI][bus][measurement], phase)
-                continue
-            end
-            
+        for ph in phases
+            if !haskey(ds[:AMI][bus][measurement], ph); continue; end
             t_raw = ds[:AMI][bus][:times]
-            v_raw = ds[:AMI][bus][measurement][phase]
-            
+            v_raw = ds[:AMI][bus][measurement][ph]
             t_hours = t_raw ./ 3600.0
             t, v = smart_downsample(t_hours, v_raw, max_points_per_sensor)
-            
             if std(v) < 1e-6 || !all(isfinite.(v))
-                println("  ⚠️  Skip AMI-$bus-$phase-$measurement (invalid data)")
+                println("  ⚠️  Skip AMI-$bus-$ph-$measurement (invalid data)")
                 continue
             end
-            
             push!(times_list, t)
             push!(values_list, v)
-            
-            # Create descriptive name
-            meas_name = measurement == :P_kW ? "P" : "Q"
-            push!(names_list, "AMI-$bus-$phase-$meas_name")
+            push!(names_list, "AMI-$bus-$ph-$(measurement == :P_kW ? "P" : "Q")")
             push!(types_list, :AMI)
-            
             ami_count += 1
-            println("  ✓ AMI-$bus-$phase-$meas_name: $(length(v)) points " *
-                    "(range: $(round(minimum(v), digits=2)) ~ $(round(maximum(v), digits=2)))")
+            println("  ✓ AMI-$bus-$ph-$(measurement): $(length(v)) pts (range: $(round(minimum(v), digits=2)) ~ $(round(maximum(v), digits=2)))")
         end
     end
     println("  Total AMI sensors: $ami_count")
     
-    # Process PMU sensor (if available)
     println("\n[PMU Sensors]")
     pmu_count = 0
     if haskey(ds, :PMU705)
-        for phase in [:A, :B, :C]
-            if !haskey(ds[:PMU705][:Vmag], phase)
-                continue
-            end
-            
+        for ph in [:A, :B, :C]
+            if !haskey(ds[:PMU705][:Vmag], ph); continue; end
             t_raw = ds[:PMU705][:times]
-            v_raw = ds[:PMU705][:Vmag][phase]
-            
+            v_raw = ds[:PMU705][:Vmag][ph]
             t_hours = t_raw ./ 3600.0
             t, v = smart_downsample(t_hours, v_raw, max_points_per_sensor)
-            
             if std(v) < 1e-6 || !all(isfinite.(v))
-                println("  ⚠️  Skip PMU-705-$phase (invalid data)")
+                println("  ⚠️  Skip PMU-705-$ph (invalid data)")
                 continue
             end
-            
             push!(times_list, t)
             push!(values_list, v)
-            push!(names_list, "PMU-705-$phase-Vmag")
+            push!(names_list, "PMU-705-$ph-Vmag")
             push!(types_list, :PMU)
-            
             pmu_count += 1
-            println("  ✓ PMU-705-$phase-Vmag: $(length(v)) points (original: $(length(v_raw))) " *
-                    "(range: $(round(minimum(v), digits=2)) ~ $(round(maximum(v), digits=2)))")
+            println("  ✓ PMU-705-$ph-Vmag: $(length(v)) pts (range: $(round(minimum(v), digits=2)) ~ $(round(maximum(v), digits=2)))")
         end
     end
     println("  Total PMU sensors: $pmu_count")
@@ -229,57 +191,30 @@ function normalize_multisensor_data(data::MultiSensorData)
     all_times = vcat(data.times...)
     x_mean = Float32(mean(all_times))
     x_std = Float32(std(all_times))
-    
     y_means = Float32[]
     y_stds = Float32[]
     times_norm = Vector{Vector{Float32}}()
     values_norm = Vector{Vector{Float32}}()
-    
     for s in 1:data.S
         t_norm = (data.times[s] .- x_mean) ./ x_std
         push!(times_norm, t_norm)
-        
         y_mean = Float32(mean(data.values[s]))
         y_std = Float32(std(data.values[s]))
         v_norm = (data.values[s] .- y_mean) ./ y_std
         push!(values_norm, v_norm)
-        
         push!(y_means, y_mean)
         push!(y_stds, y_std)
     end
-    
     norm_params = NormalizationParams(x_mean, x_std, y_means, y_stds)
-    norm_data = MultiSensorData(data.S, times_norm, values_norm, 
-                                 data.sensor_names, data.sensor_types)
-    
+    norm_data = MultiSensorData(data.S, times_norm, values_norm, data.sensor_names, data.sensor_types)
     return norm_data, norm_params
 end
 
 # ============================================
-# Kernel Functions
+# ICM/LMC MTGP
 # ============================================
 
-function compute_multitask_kernel(times_s::Vector{Float32},
-                                   times_t::Vector{Float32},
-                                   s::Int, t::Int,
-                                   σ_g::Float32, ℓ_g::Float32,
-                                   σ_s::Vector{Float32}, ℓ_s::Vector{Float32})
-    
-    Δt = times_s .- times_t'
-    K_global = σ_g^2 .* exp.(-Δt.^2 ./ (2 * ℓ_g^2))
-    
-    if s == t
-        K_local = σ_s[s]^2 .* exp.(-Δt.^2 ./ (2 * ℓ_s[s]^2))
-        return K_global .+ K_local
-    else
-        return K_global
-    end
-end
-
-# ============================================
-# Shared Mean Function
-# ============================================
-
+# Shared mean network
 function create_shared_mean_network(input_dim=1, hidden_dim=32)
     return Chain(
         Dense(input_dim, hidden_dim, relu),
@@ -288,272 +223,251 @@ function create_shared_mean_network(input_dim=1, hidden_dim=32)
     )
 end
 
-# ============================================
-# Training Functions
-# ============================================
-
-function compute_sensor_nll(times_s::Vector{Float32},
-                            values_s::Vector{Float32},
-                            s::Int,
-                            mean_func,
-                            σ_g::Float32, ℓ_g::Float32,
-                            σ_s::Vector{Float32}, ℓ_s::Vector{Float32},
-                            σ_noise::Vector{Float32};
-                            jitter::Float32=1.0f-4)
-    n = length(times_s)
-    
-    m = vec(mean_func(reshape(times_s, 1, :)))
-    K = compute_multitask_kernel(times_s, times_s, s, s,
-                                  σ_g, ℓ_g, σ_s, ℓ_s)
-    K_noisy = K + (σ_noise[s]^2 + jitter) * I
-    K_noisy = 0.5f0 .* (K_noisy .+ K_noisy')
-    
-    residual = values_s .- m
-    L = cholesky(Hermitian(K_noisy)).L
-    α = L' \ (L \ residual)
-    
-    nll = 0.5f0 * dot(residual, α) + 
-          sum(log.(diag(L))) + 
-          0.5f0 * n * log(2.0f0 * Float32(π))
-    
-    return nll
+# Task correlation matrix B = L * L'
+function build_task_correlation_matrix(L_params::Matrix{Float32})
+    L = LowerTriangular(L_params)
+    Matrix(L * L')
 end
 
-function train_multitask_gp(data::MultiSensorData;
-                             num_epochs::Int=100,
-                             lr::Float64=0.005,
-                             verbose::Bool=true,
-                             jitter::Float32=1.0f-4)
-    
-    S = data.S
-    
-    if verbose
-        println("\nNormalizing data...")
+# RBF kernel
+function rbf_kernel(t1::Vector{Float32}, t2::Vector{Float32}, σ::Float32, ℓ::Float32)
+    Δ = t1 .- t2'
+    @. (σ^2) * exp( - (Δ^2) / (2f0 * ℓ^2) )
+end
+
+# Construct joint covariance K_all and add per-task noise inside construction (non-inplace)
+# K((s,x),(t,x′)) = B_{st} k_time(x,x′) + δ_{st} k_local_s(x,x′) + δ_{st} σ_noise[s]^2 I
+function construct_joint_K_all(times::Vector{Vector{Float32}},
+                               B::Matrix{Float32},
+                               σ_time::Float32, ℓ_time::Float32,
+                               σ_locals::Vector{Float32}, ℓ_locals::Vector{Float32},
+                               σ_noise::Vector{Float32}, jitter::Float32)
+    S = length(times)
+    row_blocks = map(1:S) do s
+        reduce(hcat, map(1:S) do t
+            K_block = B[s, t] .* rbf_kernel(times[s], times[t], σ_time, ℓ_time)
+            if s == t
+                K_block = K_block .+ rbf_kernel(times[s], times[t], σ_locals[s], ℓ_locals[s])
+                K_block = add_diag_copy(K_block, σ_noise[s]^2 + jitter)
+            end
+            K_block
+        end)
     end
+    reduce(vcat, row_blocks)
+end
+
+# Build joint dataset in normalized space
+function build_joint_dataset(data::MultiSensorData)
     norm_data, norm_params = normalize_multisensor_data(data)
-    
+    x_all = vcat(norm_data.times...)
+    y_all = vcat(norm_data.values...)
+    n_per_task = length.(norm_data.times)
+    offsets = cumsum(vcat(0, n_per_task[1:end-1]))
+    return (; norm_data, norm_params, x_all, y_all, n_per_task, offsets)
+end
+
+# Mean forward
+mean_forward(mean_func, x_all::Vector{Float32}) = vec(mean_func(reshape(x_all, 1, :)))
+
+# Joint NLL
+function joint_nll_icm(params, joint_pack; jitter::Float32=1f-5)
+    mean_func    = params.mean_func
+    L_params     = params.L_params
+    log_σ_time   = params.log_σ_time
+    log_ℓ_time   = params.log_ℓ_time
+    log_σ_locals = params.log_σ_locals
+    log_ℓ_locals = params.log_ℓ_locals
+    log_σ_noise  = params.log_σ_noise
+
+    norm_data   = joint_pack.norm_data
+    x_all       = joint_pack.x_all
+    y_all       = joint_pack.y_all
+
+    S = norm_data.S
+
+    B = build_task_correlation_matrix(L_params)
+    σ_time = exp(log_σ_time[])
+    ℓ_time = exp(log_ℓ_time[])
+    σ_locals = exp.(log_σ_locals)
+    ℓ_locals = exp.(log_ℓ_locals)
+    σ_noise  = exp.(log_σ_noise)
+
+    # Build K_all with noise inside (no in-place modifications)
+    K_all = construct_joint_K_all(norm_data.times, B, σ_time, ℓ_time, σ_locals, ℓ_locals, σ_noise, jitter)
+
+    m_all = mean_forward(mean_func, x_all)
+    r = y_all .- m_all
+
+    K_sym = Hermitian(0.5f0 .* (K_all .+ K_all'))
+    L = cholesky(K_sym).L
+    α = L' \ (L \ r)
+    N = length(y_all)
+
+    0.5f0 * dot(r, α) + sum(log.(diag(L))) + 0.5f0 * N * log(2f0 * Float32(pi))
+end
+
+# Train ICM MTGP
+function train_icm_mtgp(data::MultiSensorData; num_epochs::Int=200, lr::Float64=0.01, verbose::Bool=true)
+    joint_pack = build_joint_dataset(data)
+    S = data.S
+
     mean_func = create_shared_mean_network(1, 32)
-    
-    log_σ_g = Float32[log(1.0)]
-    log_ℓ_g = Float32[log(0.5)]
-    log_σ_s = Float32[log(0.3) for _ in 1:S]
-    log_ℓ_s = Float32[log(0.3) for _ in 1:S]
-    log_σ_noise = Float32[log(0.1) for _ in 1:S]
-    
-    if verbose
-        println("\nInitial hyperparameters:")
-        println("  Global: σ_g=$(round(exp(log_σ_g[1]), digits=4)), " *
-                "ℓ_g=$(round(exp(log_ℓ_g[1]), digits=4))")
-        println("  Jitter: $jitter")
-        println("  Number of sensors: $S")
-    end
-    
-    ps = Flux.params(mean_func, log_σ_g, log_ℓ_g, 
-                     log_σ_s, log_ℓ_s, log_σ_noise)
+
+    # Initialize params
+    L_params = Matrix{Float32}(I, S, S)          # B = I initially
+    log_σ_time = Float32[log(1.0)]
+    log_ℓ_time = Float32[log(0.5)]
+    log_σ_locals = fill(Float32(log(0.3)), S)
+    log_ℓ_locals = fill(Float32(log(0.3)), S)
+    log_σ_noise  = fill(Float32(log(0.1)), S)
+
+    params = (
+        mean_func = mean_func,
+        L_params = L_params,
+        log_σ_time = log_σ_time,
+        log_ℓ_time = log_ℓ_time,
+        log_σ_locals = log_σ_locals,
+        log_ℓ_locals = log_ℓ_locals,
+        log_σ_noise = log_σ_noise
+    )
+
+    ps = Flux.params(mean_func, L_params, log_σ_time, log_ℓ_time, log_σ_locals, log_ℓ_locals, log_σ_noise)
     opt = Flux.Adam(lr)
-    
+
     losses = Float32[]
-    σ_g_history = Float32[]
-    ℓ_g_history = Float32[]
-    
-    best_loss = Inf32
-    patience = 20
-    patience_counter = 0
-    
+    best = Inf32
+    patience = 30
+    stall = 0
+
     println("\n" * "="^70)
-    println("Training Multi-task Gaussian Process")
+    println("Training ICM/LMC Multi-task GP (Joint LML)")
     println("="^70)
-    
+
     @showprogress for epoch in 1:num_epochs
-        local total_loss
-        
-        try
-            gs = Flux.gradient(ps) do
-                σ_g = exp(log_σ_g[1])
-                ℓ_g = exp(log_ℓ_g[1])
-                σ_s = exp.(log_σ_s)
-                ℓ_s = exp.(log_ℓ_s)
-                σ_noise = exp.(log_σ_noise)
-                
-                total_nll = 0.0f0
-                for s in 1:S
-                    nll_s = compute_sensor_nll(
-                        norm_data.times[s],
-                        norm_data.values[s],
-                        s, mean_func,
-                        σ_g, ℓ_g, σ_s, ℓ_s, σ_noise;
-                        jitter=jitter
-                    )
-                    total_nll += nll_s
-                end
-                
-                total_loss = total_nll
-                return total_loss
-            end
-            
-            if !isnan(total_loss) && !isinf(total_loss) && total_loss > 0
-                Flux.update!(opt, ps, gs)
-                push!(losses, total_loss)
-                push!(σ_g_history, exp(log_σ_g[1]))
-                push!(ℓ_g_history, exp(log_ℓ_g[1]))
-                
-                if total_loss < best_loss
-                    best_loss = total_loss
-                    patience_counter = 0
-                else
-                    patience_counter += 1
-                end
-                
-                if patience_counter >= patience && epoch > 30
-                    if verbose
-                        println("\nEarly stopping: no improvement for $patience epochs")
-                    end
-                    break
-                end
-            else
-                if verbose
-                    println("\nWarning: Invalid loss at epoch $epoch")
-                end
-                if !isempty(losses)
-                    push!(losses, losses[end])
-                    push!(σ_g_history, σ_g_history[end])
-                    push!(ℓ_g_history, ℓ_g_history[end])
-                end
-            end
-            
-        catch e
-            if verbose
-                println("\nError at epoch $epoch: $e")
-            end
-            if !isempty(losses)
-                push!(losses, losses[end])
-                push!(σ_g_history, σ_g_history[end])
-                push!(ℓ_g_history, ℓ_g_history[end])
-            end
-            continue
+        gs = Flux.gradient(ps) do
+            joint_nll_icm(params, joint_pack; jitter=1f-5)
         end
-        
+        Flux.update!(opt, ps, gs)
+        loss = joint_nll_icm(params, joint_pack; jitter=1f-5)
+        push!(losses, loss)
+
         if verbose && (epoch % 10 == 0 || epoch == 1)
-            println("\nEpoch $epoch/$num_epochs")
-            println("  Loss: $(round(total_loss, digits=4))")
-            println("  σ_g: $(round(exp(log_σ_g[1]), digits=4)), " *
-                    "ℓ_g: $(round(exp(log_ℓ_g[1]), digits=4))")
+            println("Epoch $epoch, NLL = $(round(loss, digits=4))")
+        end
+
+        if loss + 1e-5 < best
+            best = loss
+            stall = 0
+        else
+            stall += 1
+            if stall >= patience && epoch > 50
+                verbose && println("Early stopping at epoch $epoch")
+                break
+            end
         end
     end
-    
-    println("\n" * "="^70)
-    println("Training Complete!")
-    println("="^70)
-    
-    σ_g_final = exp(log_σ_g[1])
-    ℓ_g_final = exp(log_ℓ_g[1]) * norm_params.x_std
-    σ_s_final = exp.(log_σ_s) .* norm_params.y_stds
-    ℓ_s_final = exp.(log_ℓ_s) .* norm_params.x_std
-    σ_noise_final = exp.(log_σ_noise) .* norm_params.y_stds
-    
+
+    # For reporting in original scale (optional)
+    σ_time_final = exp(log_σ_time[]) * mean(joint_pack.norm_params.y_stds)
+    ℓ_time_final = exp(log_ℓ_time[]) * joint_pack.norm_params.x_std
+    σ_locals_final = exp.(log_σ_locals) .* joint_pack.norm_params.y_stds
+    ℓ_locals_final = exp.(log_ℓ_locals) .* joint_pack.norm_params.x_std
+    σ_noise_final  = exp.(log_σ_noise)  .* joint_pack.norm_params.y_stds
+
     return (
         mean_func = mean_func,
-        σ_g = σ_g_final,
-        ℓ_g = ℓ_g_final,
-        σ_s = σ_s_final,
-        ℓ_s = ℓ_s_final,
+        L_params = L_params,
+        log_σ_time = log_σ_time,
+        log_ℓ_time = log_ℓ_time,
+        log_σ_locals = log_σ_locals,
+        log_ℓ_locals = log_ℓ_locals,
+        log_σ_noise  = log_σ_noise,
+        σ_time = σ_time_final,
+        ℓ_time = ℓ_time_final,
+        σ_locals = σ_locals_final,
+        ℓ_locals = ℓ_locals_final,
         σ_noise = σ_noise_final,
         losses = losses,
-        σ_g_history = σ_g_history,
-        ℓ_g_history = ℓ_g_history,
-        norm_params = norm_params,
-        data = data,
-        jitter = jitter
+        norm_params = joint_pack.norm_params,
+        joint_pack = joint_pack,
+        data = data
     )
 end
 
-# ============================================
-# Prediction Functions
-# ============================================
-
-function robust_cholesky(K::Matrix{Float32}; max_tries::Int=5, initial_jitter::Float32=1.0f-6)
-    jitter = initial_jitter
-    
-    for i in 1:max_tries
-        try
-            K_noisy = K + jitter * I
-            K_noisy = Hermitian(0.5f0 .* (K_noisy .+ K_noisy'))
-            L = cholesky(K_noisy).L
-            return L, true, jitter
-        catch e
-            if i < max_tries
-                jitter *= 10.0f0
-            else
-                return nothing, false, jitter
-            end
-        end
-    end
-end
-
-function multitask_gp_predict(result, sensor_idx::Int, x_test::Vector{Float32})
+# Predict jointly for a given task s
+function icm_predict(result, s::Int, x_test::Vector{Float32})
     data = result.data
-    norm_params = result.norm_params
-    
-    x_train = (data.times[sensor_idx] .- norm_params.x_mean) ./ norm_params.x_std
-    y_train = (data.values[sensor_idx] .- norm_params.y_means[sensor_idx]) ./ 
-              norm_params.y_stds[sensor_idx]
-    x_test_norm = (x_test .- norm_params.x_mean) ./ norm_params.x_std
-    
-    σ_g_norm = result.σ_g / norm_params.y_stds[sensor_idx]
-    ℓ_g_norm = result.ℓ_g / norm_params.x_std
-    σ_s_norm = result.σ_s ./ norm_params.y_stds
-    ℓ_s_norm = result.ℓ_s ./ norm_params.x_std
-    σ_noise_norm = result.σ_noise[sensor_idx] / norm_params.y_stds[sensor_idx]
-    
-    m_train = vec(result.mean_func(reshape(x_train, 1, :)))
-    m_test = vec(result.mean_func(reshape(x_test_norm, 1, :)))
-    
-    K_xx = compute_multitask_kernel(x_train, x_train, sensor_idx, sensor_idx,
-                                     σ_g_norm, ℓ_g_norm, σ_s_norm, ℓ_s_norm)
-    
-    K_xx_base = K_xx + σ_noise_norm^2 * I
-    L, success, used_jitter = robust_cholesky(K_xx_base, initial_jitter=result.jitter)
-    
-    if !success
-        @warn "Cholesky failed during prediction for sensor $(data.sensor_names[sensor_idx])"
-        μ_star = m_test .* norm_params.y_stds[sensor_idx] .+ norm_params.y_means[sensor_idx]
-        σ_star = ones(Float32, length(m_test)) .* norm_params.y_stds[sensor_idx]
-        return μ_star, σ_star
+    S = data.S
+    normp = result.norm_params
+
+    x_test_norm = (x_test .- normp.x_mean) ./ normp.x_std
+
+    joint_pack = result.joint_pack
+    x_all = joint_pack.x_all
+    y_all = joint_pack.y_all
+
+    B = build_task_correlation_matrix(result.L_params)
+
+    # Predict in normalized space for stability
+    σ_time = exp(result.log_σ_time[])
+    ℓ_time = exp(result.log_ℓ_time[])
+    σ_locals = exp.(result.log_σ_locals)
+    ℓ_locals = exp.(result.log_ℓ_locals)
+    σ_noise  = exp.(result.log_σ_noise)
+
+    # K_all with noise inside construction (same as training)
+    K_all = construct_joint_K_all(joint_pack.norm_data.times, B, σ_time, ℓ_time, σ_locals, ℓ_locals, σ_noise, 1f-6)
+    K_sym = Hermitian(0.5f0 .* (K_all .+ K_all'))
+    L = cholesky(K_sym).L
+
+    # K_x_star: N x n*
+    n_star = length(x_test_norm)
+    K_x_star = zeros(Float32, length(x_all), n_star)
+
+    offsets = joint_pack.offsets
+    n_per_task = joint_pack.n_per_task
+
+    for i in 1:S
+        xi = joint_pack.norm_data.times[i]
+        K_time_is = rbf_kernel(xi, x_test_norm, σ_time, ℓ_time)
+        K_local = (i == s) ? rbf_kernel(xi, x_test_norm, σ_locals[s], ℓ_locals[s]) :
+                             zeros(Float32, size(K_time_is))
+        block = B[i,s] .* K_time_is .+ K_local
+        os = offsets[i]; ns = n_per_task[i]
+        @views K_x_star[os+1:os+ns, :] .= block
     end
-    
-    K_x_star = compute_multitask_kernel(x_train, x_test_norm, sensor_idx, sensor_idx,
-                                         σ_g_norm, ℓ_g_norm, σ_s_norm, ℓ_s_norm)
-    K_star_star = compute_multitask_kernel(x_test_norm, x_test_norm, 
-                                            sensor_idx, sensor_idx,
-                                            σ_g_norm, ℓ_g_norm, σ_s_norm, ℓ_s_norm)
-    
-    residual = y_train .- m_train
-    α = L' \ (L \ residual)
-    μ_star_norm = m_test .+ K_x_star' * α
-    
+
+    m_all = mean_forward(result.mean_func, x_all)
+    r = y_all .- m_all
+    α = L' \ (L \ r)
+
+    m_star = vec(result.mean_func(reshape(x_test_norm, 1, :)))
+    μ_star_norm = m_star .+ K_x_star' * α
+
     v = L \ K_x_star
-    cov_star = K_star_star - v' * v
-    σ_star_norm = sqrt.(max.(diag(cov_star), 1.0f-8))
-    
-    μ_star = μ_star_norm .* norm_params.y_stds[sensor_idx] .+ norm_params.y_means[sensor_idx]
-    σ_star = σ_star_norm .* norm_params.y_stds[sensor_idx]
-    
+    Kss = B[s,s] .* rbf_kernel(x_test_norm, x_test_norm, σ_time, ℓ_time) .+
+          rbf_kernel(x_test_norm, x_test_norm, σ_locals[s], ℓ_locals[s])
+    cov_star = Kss .- v' * v
+    σ_star_norm = sqrt.(max.(diag(cov_star), 1f-8))
+
+    μ_star = μ_star_norm .* joint_pack.norm_params.y_stds[s] .+ joint_pack.norm_params.y_means[s]
+    σ_star = σ_star_norm .* joint_pack.norm_params.y_stds[s]
     return μ_star, σ_star
 end
 
 # ============================================
-# Main Program
+# Main
 # ============================================
 
 function main_multitask()
     Random.seed!(42)
     
     println("="^70)
-    println("Multi-task Gaussian Process (MTGP) - Full Sensor Version")
+    println("Multi-task Gaussian Process (MTGP) - ICM/LMC Joint Version (No in-place)")
     println("="^70)
     
     println("\n[1] Loading data...")
-    feeder_dir = "D:/luosipeng/Deep_Learning_in_Distribution_System/data"
+    feeder_dir = "D:/luosipeng/Deep_Learning_in_Distribution_System/data"  # adjust to your path
     res = time_series_ieee37(
         feeder_dir;
         dt_s=0.1,
@@ -565,44 +479,30 @@ function main_multitask()
     ds = extract_requested_dataset(res)
     
     println("\n[2] Building complete multi-sensor dataset...")
-    data = build_complete_multisensor_data(
-        ds;
-        max_points_per_sensor = 300
-    )
+    data = build_complete_multisensor_data(ds; max_points_per_sensor = 300)
     
-    println("\n[3] Training multi-task GP...")
-    result = train_multitask_gp(
-        data;
-        num_epochs = 100,
-        lr = 0.005,
-        verbose = true,
-        jitter = 1.0f-4
-    )
+    println("\n[3] Training multi-task GP (ICM/LMC)...")
+    result = train_icm_mtgp(data; num_epochs = 200, lr = 0.01, verbose = true)
     
-    println("\n[4] Final hyperparameters:")
+    println("\n[4] Final hyperparameters (reported in original scale):")
     println("="^70)
-    println("Global parameters:")
-    println("  σ_g = $(round(result.σ_g, digits=4))")
-    println("  ℓ_g = $(round(result.ℓ_g, digits=4)) hours")
-    println("\nLocal parameters (top 10 sensors by SNR):")
+    println("Global time kernel:")
+    println("  σ_time = $(round(result.σ_time, digits=4))")
+    println("  ℓ_time = $(round(result.ℓ_time, digits=4)) hours")
+    println("\nLocal per-sensor kernel (top 10 by σ_locals/σ_noise):")
     
-    # Sort sensors by SNR
-    snrs = result.σ_s ./ result.σ_noise
+    snrs = (result.σ_locals) ./ (result.σ_noise .+ 1e-12)
     sorted_indices = sortperm(snrs, rev=true)
-    
     for i in 1:min(10, data.S)
         s = sorted_indices[i]
         println("  $(data.sensor_names[s]):")
-        println("    σ_s = $(round(result.σ_s[s], digits=4))")
-        println("    ℓ_s = $(round(result.ℓ_s[s], digits=4)) hours")
+        println("    σ_local = $(round(result.σ_locals[s], digits=4))")
+        println("    ℓ_local = $(round(result.ℓ_locals[s], digits=4)) hours")
         println("    σ_noise = $(round(result.σ_noise[s], digits=4))")
         println("    SNR = $(round(snrs[s], digits=2))")
     end
     
-    println("\n[5] Generating visualizations...")
-    
-    # Select diverse sensors for visualization
-    # Pick 2 SCADA, 2 AMI, 1 PMU (if available)
+    println("\n[5] Visualizations...")
     scada_indices = findall(x -> x == :SCADA, data.sensor_types)
     ami_indices = findall(x -> x == :AMI, data.sensor_types)
     pmu_indices = findall(x -> x == :PMU, data.sensor_types)
@@ -617,16 +517,12 @@ function main_multitask()
     if length(pmu_indices) >= 1
         push!(selected_indices, pmu_indices[1])
     end
-    
-    # Limit to 9 plots maximum
     selected_indices = selected_indices[1:min(9, length(selected_indices))]
     
     plots_list = []
-    
     for s in selected_indices
         x_test = range(minimum(data.times[s]), maximum(data.times[s]), length=200)
-        μ_pred, σ_pred = multitask_gp_predict(result, s, collect(Float32, x_test))
-        
+        μ_pred, σ_pred = icm_predict(result, s, collect(Float32, x_test))
         p = plot(x_test, μ_pred,
                  ribbon = 1.96 .* σ_pred,
                  label = "Pred (95% CI)",
@@ -639,150 +535,70 @@ function main_multitask()
                  size = (500, 350),
                  margin = 4Plots.mm,
                  titlefontsize = 8)
-        
         scatter!(p, data.times[s], data.values[s],
                  label = "Data",
                  markersize = 1.5,
                  alpha = 0.6,
                  color = :red)
-        
         push!(plots_list, p)
     end
     
-    # Combined plot
     n_plots = length(plots_list)
-    layout = (ceil(Int, n_plots/3), 3)
-    combined = plot(plots_list..., 
-                   layout = layout, 
-                   size = (1400, 320 * layout[1]),
-                   margin = 6Plots.mm)
-    display(combined)
-    savefig(combined, "multitask_gp_predictions_full.png")
-    println("  ✓ Saved: multitask_gp_predictions_full.png")
+    if n_plots > 0
+        layout = (ceil(Int, n_plots/3), 3)
+        combined = plot(plots_list..., 
+                        layout = layout, 
+                        size = (1400, 320 * layout[1]),
+                        margin = 6Plots.mm)
+        display(combined)
+        savefig(combined, "mtgp_icm_predictions.png")
+        println("  ✓ Saved: mtgp_icm_predictions.png")
+    end
     
-    # Loss curve
     valid_losses = filter(x -> isfinite(x) && x > 0, result.losses)
     if !isempty(valid_losses)
         p_loss = plot(valid_losses, 
                       xlabel = "Epoch", 
                       ylabel = "Total NLL",
-                      title = "Training Loss", 
+                      title = "Training Loss (Joint LML)", 
                       linewidth = 2, 
                       legend = false,
                       yscale = :log10, 
                       size = (700, 450),
                       margin = 5Plots.mm)
         display(p_loss)
-        savefig(p_loss, "multitask_gp_loss_full.png")
-        println("  ✓ Saved: multitask_gp_loss_full.png")
+        savefig(p_loss, "mtgp_icm_loss.png")
+        println("  ✓ Saved: mtgp_icm_loss.png")
     end
     
-    # Hyperparameter evolution
-    if !isempty(result.ℓ_g_history) && !isempty(result.σ_g_history)
-        p_hyper = plot(result.ℓ_g_history,
-                       label = "Global length scale (ℓ_g)",
-                       xlabel = "Epoch",
-                       ylabel = "Value (normalized)",
-                       title = "Hyperparameter Evolution",
-                       linewidth = 2,
-                       legend = :topright,
-                       size = (700, 450),
-                       margin = 5Plots.mm)
-        plot!(p_hyper, result.σ_g_history,
-              label = "Global signal variance (σ_g)",
-                            linewidth = 2)
-        display(p_hyper)
-        savefig(p_hyper, "multitask_gp_hyperparams_full.png")
-        println("  ✓ Saved: multitask_gp_hyperparams_full.png")
+    if data.S > 0
+        sorted_indices = sortperm(snrs, rev=true)
+        colors = [data.sensor_types[i] == :SCADA ? :blue : 
+                  (data.sensor_types[i] == :AMI ? :green : :red) 
+                  for i in sorted_indices]
+        p_snr = bar(1:data.S, snrs[sorted_indices],
+                    xlabel = "Sensor Index (sorted by SNR)",
+                    ylabel = "Signal-to-Noise Ratio",
+                    title = "SNR by Sensor (Blue=SCADA, Green=AMI, Red=PMU)",
+                    legend = false,
+                    color = colors,
+                    size = (1000, 500),
+                    margin = 5Plots.mm,
+                    xticks = (1:5:data.S, string.(1:5:data.S)))
+        display(p_snr)
+        savefig(p_snr, "mtgp_icm_snr.png")
+        println("  ✓ Saved: mtgp_icm_snr.png")
     end
     
-    # SNR analysis plot
-    println("\n[6] Generating SNR analysis...")
-    snrs = result.σ_s ./ result.σ_noise
-    sorted_indices = sortperm(snrs, rev=true)
-    
-    # Color by sensor type
-    colors = [data.sensor_types[i] == :SCADA ? :blue : 
-              (data.sensor_types[i] == :AMI ? :green : :red) 
-              for i in sorted_indices]
-    
-    p_snr = bar(1:data.S, snrs[sorted_indices],
-                xlabel = "Sensor Index (sorted by SNR)",
-                ylabel = "Signal-to-Noise Ratio",
-                title = "SNR by Sensor (Blue=SCADA, Green=AMI, Red=PMU)",
-                legend = false,
-                color = colors,
-                size = (1000, 500),
-                margin = 5Plots.mm,
-                xticks = (1:5:data.S, string.(1:5:data.S)))
-    display(p_snr)
-    savefig(p_snr, "multitask_gp_snr_analysis.png")
-    println("  ✓ Saved: multitask_gp_snr_analysis.png")
-    
-    # Length scale analysis
-    println("\n[7] Generating length scale analysis...")
-    sorted_ls_indices = sortperm(result.ℓ_s, rev=true)
-    colors_ls = [data.sensor_types[i] == :SCADA ? :blue : 
-                 (data.sensor_types[i] == :AMI ? :green : :red) 
-                 for i in sorted_ls_indices]
-    
-    p_ls = bar(1:data.S, result.ℓ_s[sorted_ls_indices],
-               xlabel = "Sensor Index (sorted by length scale)",
-               ylabel = "Length Scale (hours)",
-               title = "Local Length Scales (Blue=SCADA, Green=AMI, Red=PMU)",
-               legend = false,
-               color = colors_ls,
-               size = (1000, 500),
-               margin = 5Plots.mm,
-               xticks = (1:5:data.S, string.(1:5:data.S)))
-    hline!(p_ls, [result.ℓ_g], 
-           label = "Global ℓ_g", 
-           linewidth = 2, 
-           linestyle = :dash, 
-           color = :black,
-           legend = :topright)
-    display(p_ls)
-    savefig(p_ls, "multitask_gp_lengthscale_analysis.png")
-    println("  ✓ Saved: multitask_gp_lengthscale_analysis.png")
-    
-    # Summary statistics
-    println("\n[8] Summary Statistics:")
+    println("\n[6] Summary:")
     println("="^70)
-    println("Signal-to-Noise Ratio:")
     println("  Mean SNR: $(round(mean(snrs), digits=2))")
     println("  Median SNR: $(round(median(snrs), digits=2))")
     println("  Max SNR: $(round(maximum(snrs), digits=2)) ($(data.sensor_names[argmax(snrs)]))")
     println("  Min SNR: $(round(minimum(snrs), digits=2)) ($(data.sensor_names[argmin(snrs)]))")
-    
-    println("\nLength Scales:")
-    println("  Global ℓ_g: $(round(result.ℓ_g, digits=4)) hours")
-    println("  Mean local ℓ_s: $(round(mean(result.ℓ_s), digits=4)) hours")
-    println("  Median local ℓ_s: $(round(median(result.ℓ_s), digits=4)) hours")
-    println("  Max local ℓ_s: $(round(maximum(result.ℓ_s), digits=4)) hours")
-    println("  Min local ℓ_s: $(round(minimum(result.ℓ_s), digits=4)) hours")
-    
-    println("\nNoise Levels:")
+    println("  Global ℓ_time: $(round(result.ℓ_time, digits=4)) hours")
+    println("  Mean ℓ_local: $(round(mean(result.ℓ_locals), digits=4)) hours")
     println("  Mean σ_noise: $(round(mean(result.σ_noise), digits=4))")
-    println("  Median σ_noise: $(round(median(result.σ_noise), digits=4))")
-    
-    # Sensor type breakdown
-    scada_snrs = snrs[data.sensor_types .== :SCADA]
-    ami_snrs = snrs[data.sensor_types .== :AMI]
-    pmu_snrs = snrs[data.sensor_types .== :PMU]
-    
-    println("\nSNR by Sensor Type:")
-    if !isempty(scada_snrs)
-        println("  SCADA - Mean: $(round(mean(scada_snrs), digits=2)), " *
-                "Median: $(round(median(scada_snrs), digits=2))")
-    end
-    if !isempty(ami_snrs)
-        println("  AMI   - Mean: $(round(mean(ami_snrs), digits=2)), " *
-                "Median: $(round(median(ami_snrs), digits=2))")
-    end
-    if !isempty(pmu_snrs)
-        println("  PMU   - Mean: $(round(mean(pmu_snrs), digits=2)), " *
-                "Median: $(round(median(pmu_snrs), digits=2))")
-    end
     
     println("\n" * "="^70)
     println("Complete!")
@@ -792,167 +608,15 @@ function main_multitask()
 end
 
 # ============================================
-# Additional Analysis Functions
-# ============================================
-
-"""
-Compute correlation matrix between sensors using learned kernel
-"""
-function compute_sensor_correlation_matrix(result)
-    S = result.data.S
-    corr_matrix = zeros(Float32, S, S)
-    
-    # Use a common time point (e.g., midpoint)
-    t_ref = Float32[0.0]  # Normalized time
-    
-    for i in 1:S
-        for j in 1:S
-            K_ij = compute_multitask_kernel(
-                t_ref, t_ref, i, j,
-                result.σ_g / result.norm_params.y_stds[i],
-                result.ℓ_g / result.norm_params.x_std,
-                result.σ_s ./ result.norm_params.y_stds,
-                result.ℓ_s ./ result.norm_params.x_std
-            )
-            
-            K_ii = compute_multitask_kernel(
-                t_ref, t_ref, i, i,
-                result.σ_g / result.norm_params.y_stds[i],
-                result.ℓ_g / result.norm_params.x_std,
-                result.σ_s ./ result.norm_params.y_stds,
-                result.ℓ_s ./ result.norm_params.x_std
-            )
-            
-            K_jj = compute_multitask_kernel(
-                t_ref, t_ref, j, j,
-                result.σ_g / result.norm_params.y_stds[j],
-                result.ℓ_g / result.norm_params.x_std,
-                result.σ_s ./ result.norm_params.y_stds,
-                result.ℓ_s ./ result.norm_params.x_std
-            )
-            
-            corr_matrix[i, j] = K_ij[1] / sqrt(K_ii[1] * K_jj[1])
-        end
-    end
-    
-    return corr_matrix
-end
-
-"""
-Plot sensor correlation heatmap
-"""
-function plot_sensor_correlations(result; max_sensors::Int=20)
-    S = min(result.data.S, max_sensors)
-    
-    println("\nComputing sensor correlations (first $S sensors)...")
-    
-    # Compute correlation for subset
-    corr_subset = zeros(Float32, S, S)
-    t_ref = Float32[0.0]
-    
-    for i in 1:S
-        for j in 1:S
-            K_ij = compute_multitask_kernel(
-                t_ref, t_ref, i, j,
-                result.σ_g / result.norm_params.y_stds[i],
-                result.ℓ_g / result.norm_params.x_std,
-                result.σ_s ./ result.norm_params.y_stds,
-                result.ℓ_s ./ result.norm_params.x_std
-            )
-            
-            K_ii = compute_multitask_kernel(
-                t_ref, t_ref, i, i,
-                result.σ_g / result.norm_params.y_stds[i],
-                result.ℓ_g / result.norm_params.x_std,
-                result.σ_s ./ result.norm_params.y_stds,
-                result.ℓ_s ./ result.norm_params.x_std
-            )
-            
-            K_jj = compute_multitask_kernel(
-                t_ref, t_ref, j, j,
-                result.σ_g / result.norm_params.y_stds[j],
-                result.ℓ_g / result.norm_params.x_std,
-                result.σ_s ./ result.norm_params.y_stds,
-                result.ℓ_s ./ result.norm_params.x_std
-            )
-            
-            corr_subset[i, j] = K_ij[1] / sqrt(K_ii[1] * K_jj[1])
-        end
-    end
-    
-    # Create short labels
-    short_names = [length(name) > 15 ? name[1:12]*"..." : name 
-                   for name in result.data.sensor_names[1:S]]
-    
-    p = heatmap(corr_subset,
-                xlabel = "Sensor Index",
-                ylabel = "Sensor Index",
-                title = "Learned Sensor Correlations",
-                color = :RdBu,
-                clims = (-1, 1),
-                size = (800, 700),
-                margin = 8Plots.mm,
-                xticks = (1:S, short_names),
-                yticks = (1:S, short_names),
-                xrotation = 45,
-                aspect_ratio = :equal)
-    
-    display(p)
-    savefig(p, "multitask_gp_correlations.png")
-    println("  ✓ Saved: multitask_gp_correlations.png")
-    
-    return corr_subset
-end
-
-"""
-Save results to file
-"""
-function save_results(result, filename::String="multitask_gp_results.txt")
-    open(filename, "w") do io
-        println(io, "="^70)
-        println(io, "Multi-task Gaussian Process Results")
-        println(io, "="^70)
-        println(io, "\nGlobal Hyperparameters:")
-        println(io, "  σ_g = $(result.σ_g)")
-        println(io, "  ℓ_g = $(result.ℓ_g) hours")
-        
-        println(io, "\nPer-Sensor Parameters:")
-        println(io, "="^70)
-        println(io, "Sensor Name | σ_s | ℓ_s (hrs) | σ_noise | SNR")
-        println(io, "-"^70)
-        
-        snrs = result.σ_s ./ result.σ_noise
-        for s in 1:result.data.S
-            println(io, "$(rpad(result.data.sensor_names[s], 35)) | " *
-                        "$(round(result.σ_s[s], digits=4)) | " *
-                        "$(round(result.ℓ_s[s], digits=4)) | " *
-                        "$(round(result.σ_noise[s], digits=4)) | " *
-                        "$(round(snrs[s], digits=2))")
-        end
-        
-        println(io, "\n" * "="^70)
-        println(io, "Summary Statistics:")
-        println(io, "  Total sensors: $(result.data.S)")
-        println(io, "  Mean SNR: $(round(mean(snrs), digits=2))")
-        println(io, "  Median SNR: $(round(median(snrs), digits=2))")
-        println(io, "  Mean local ℓ_s: $(round(mean(result.ℓ_s), digits=4)) hours")
-        # println(io, "  Final training loss: $(round(result.losses[end], digits=4))")
-    end
-    
-    println("  ✓ Saved: $filename")
-end
-
-# ============================================
-# Run Main Program
+# Entry
 # ============================================
 
 println("\n" * "="^70)
-println("Starting Multi-task GP with Full Sensor Suite")
+println("Starting Multi-task GP (ICM/LMC) with Full Sensor Suite - No In-place")
 println("="^70)
 
-# Run main training
-# result = nothing
 result = main_multitask()
+
 if result !== nothing
 unified_result = generate_1min_resolution_predictions(result)
 end
